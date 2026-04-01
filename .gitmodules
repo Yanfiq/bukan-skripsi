@@ -1,0 +1,3 @@
+[submodule "datasets/MMSD2.0"]
+	path = datasets/MMSD2.0
+	url = https://github.com/JoeYing1019/MMSD2.0.git
