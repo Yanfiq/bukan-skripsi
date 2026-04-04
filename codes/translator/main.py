@@ -3,6 +3,9 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
+import time
+import random
+import fake_useragent
 
 texts = [
     "Hello, what is your name?",
@@ -20,6 +23,8 @@ def main():
     options = Options()
     options.binary_location = "/usr/bin/google-chrome-stable" 
     options.add_experimental_option("debuggerAddress", "localhost:9222")
+    options.add_argument(f"user-agent={fake_useragent.UserAgent().random}")
+
     driver = webdriver.Chrome(options=options)
 
     driver.get(f"https://www.deepl.com/en/translator")
@@ -34,7 +39,7 @@ def main():
         input_element = driver.find_element(By.XPATH, source_xpath)
         input_element.send_keys(text)
 
-        # When the target has the copy button, the translation is finished
+        # When the target has the share button, the translation is finished
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, share_target_xpath)))
 
         target_element = driver.find_element(By.XPATH, target_xpath)
@@ -42,6 +47,9 @@ def main():
 
         print(f"Original: {text}")
         print(f"Translated: {translation}")
+
+        # random delay
+        time.sleep(random.uniform(3, 10))
 
         clear_element = driver.find_element(By.XPATH, clear_xpath)
         clear_element.click()
