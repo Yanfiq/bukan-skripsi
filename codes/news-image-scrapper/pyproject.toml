@@ -1,0 +1,10 @@
+[project]
+name = "news-image-scrapper"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fake-useragent>=2.2.0",
+    "selenium>=4.43.0",
+]
