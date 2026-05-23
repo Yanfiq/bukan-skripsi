@@ -10,8 +10,8 @@ function parseArgs(argv) {
     url: 'https://www.deepl.com/en/translator/l/en/id',
     headless: true,
     timeoutMs: 60000,
-    minDelayMs: 2500,
-    maxDelayMs: 5000,
+    minDelayMs: 1000,
+    maxDelayMs: 2000,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -82,8 +82,18 @@ async function ensureParentDir(filePath) {
 async function prepareOutputFiles(outputPath, failedPath) {
   await ensureParentDir(outputPath);
   await ensureParentDir(failedPath);
-  await fs.writeFile(outputPath, '', 'utf8');
-  await fs.writeFile(failedPath, '', 'utf8');
+
+  try {
+    await fs.access(outputPath);
+  } catch (error) {
+    await fs.writeFile(outputPath, '', 'utf8');
+  }
+
+  try {
+    await fs.access(failedPath);8
+  } catch (error) {
+    await fs.writeFile(failedPath, '', 'utf8');
+  }
 }
 
 async function dismissCookies(page) {
@@ -94,8 +104,7 @@ async function dismissCookies(page) {
 }
 
 async function translateOnce(page, text, url, timeoutMs) {
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-  await page.waitForLoadState('networkidle', { timeout: timeoutMs }).catch(() => {});
+  // Assumes `page` is already at the translator URL and cookies dismissed.
   await dismissCookies(page);
 
   const textboxes = page.locator('main [role="textbox"]');
@@ -114,7 +123,43 @@ async function translateOnce(page, text, url, timeoutMs) {
     { timeout: timeoutMs }
   );
 
-  return (await targetBox.innerText()).trim();
+  const result = (await targetBox.innerText()).trim();
+
+  // Try to press the clear button (appears after input) so next translation can start fresh.
+  await clearSource(page).catch(() => {});
+
+  return result;
+}
+
+async function clearSource(page) {
+  // Try several selectors for DeepL's clear/source-reset button, then fall back to clearing the source textbox.
+  const selectors = [
+    'button[data-testid="lmt__clear_text_button"]',
+    'button[aria-label*="Clear"]',
+    'button[aria-label*="clear"]',
+    '.lmt__clear_text_button',
+    'button[title*="Clear"]'
+  ];
+
+  for (const sel of selectors) {
+    try {
+      const el = page.locator(sel);
+      if (await el.count()) {
+        await el.first().click({ timeout: 3000 }).catch(() => {});
+        return;
+      }
+    } catch (e) {
+      // ignore and try next
+    }
+  }
+
+  // Fallback: clear the source textbox directly
+  try {
+    const src = page.locator('main [role="textbox"]').first();
+    await src.fill('');
+  } catch (e) {
+    // give up
+  }
 }
 
 async function main() {
@@ -128,8 +173,25 @@ async function main() {
 
   await prepareOutputFiles(outputPath, failedPath);
 
-  const browser = await chromium.launch({ headless: args.headless });
-  const page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
+  let browser = await chromium.launch({ headless: args.headless });
+  let page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
+
+  // Navigate to DeepL once at startup
+  await page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: args.timeoutMs }).catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: args.timeoutMs }).catch(() => {});
+  await dismissCookies(page);
+
+  async function restartBrowser(oldBrowser, headless) {
+    try {
+      if (oldBrowser) await oldBrowser.close();
+    } catch (e) {
+      // ignore errors closing old browser
+    }
+
+    const newBrowser = await chromium.launch({ headless });
+    const newPage = await newBrowser.newPage({ viewport: { width: 1440, height: 1200 } });
+    return { newBrowser, newPage };
+  }
 
   try {
     console.log(`Loaded ${texts.length} lines from ${inputPath}`);
@@ -154,6 +216,20 @@ async function main() {
         } catch (error) {
           lastError = error;
           console.error(`Failed on attempt ${attempt}: ${error.message}`);
+          // Attempt to clear state by restarting browser/page before next attempt
+          if (attempt < 3) {
+            console.log('Clearing cookies/cache by restarting browser and creating a fresh context...');
+            const res = await restartBrowser(browser, args.headless);
+            browser = res.newBrowser;
+            page = res.newPage;
+            // navigate to the translator page on the fresh page
+            await page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: args.timeoutMs }).catch(() => {});
+            await page.waitForLoadState('networkidle', { timeout: args.timeoutMs }).catch(() => {});
+            await dismissCookies(page);
+            // give the new page a moment to be ready
+            await delay(1000);
+          }
+
           await delay(1500);
         }
       }
@@ -172,7 +248,11 @@ async function main() {
       await delay(randomDelay(args.minDelayMs, args.maxDelayMs));
     }
   } finally {
-    await browser.close();
+    try {
+      if (browser) await browser.close();
+    } catch (e) {
+      // ignore close errors
+    }
   }
 }
 
