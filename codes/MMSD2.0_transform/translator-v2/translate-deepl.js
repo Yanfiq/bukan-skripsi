@@ -7,6 +7,11 @@ function parseArgs(argv) {
     input: 'texts.txt',
     output: 'translations.txt',
     failed: 'failed_translations.txt',
+    inputFormat: null,
+    outputFormat: null,
+    jsonInputKey: null,
+    jsonOutputKey: 'translation',
+    repairDuplicates: false,
     url: 'https://www.deepl.com/en/translator/l/en/id',
     headless: true,
     timeoutMs: 60000,
@@ -29,6 +34,31 @@ function parseArgs(argv) {
 
     if (current === '--failed' && argv[index + 1]) {
       args.failed = argv[++index];
+      continue;
+    }
+
+    if (current === '--input-format' && argv[index + 1]) {
+      args.inputFormat = argv[++index];
+      continue;
+    }
+
+    if (current === '--output-format' && argv[index + 1]) {
+      args.outputFormat = argv[++index];
+      continue;
+    }
+
+    if (current === '--json-input-key' && argv[index + 1]) {
+      args.jsonInputKey = argv[++index];
+      continue;
+    }
+
+    if (current === '--json-output-key' && argv[index + 1]) {
+      args.jsonOutputKey = argv[++index];
+      continue;
+    }
+
+    if (current === '--repair-duplicates') {
+      args.repairDuplicates = true;
       continue;
     }
 
@@ -79,20 +109,224 @@ async function ensureParentDir(filePath) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
 }
 
-async function prepareOutputFiles(outputPath, failedPath) {
+async function prepareOutputFiles(outputPath, failedPath, outputFormat = 'txt') {
   await ensureParentDir(outputPath);
   await ensureParentDir(failedPath);
 
   try {
     await fs.access(outputPath);
   } catch (error) {
-    await fs.writeFile(outputPath, '', 'utf8');
+    if (outputFormat === 'json') {
+      // Start a JSON array but don't close it; we'll append items incrementally.
+      await fs.writeFile(outputPath, '[\n', 'utf8');
+    } else {
+      await fs.writeFile(outputPath, '', 'utf8');
+    }
   }
 
   try {
-    await fs.access(failedPath);8
+    await fs.access(failedPath);
   } catch (error) {
     await fs.writeFile(failedPath, '', 'utf8');
+  }
+}
+
+function inferFormat(filePath, explicitFormat) {
+  if (explicitFormat) {
+    return explicitFormat.toLowerCase();
+  }
+
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.json') return 'json';
+  return 'txt';
+}
+
+function getByPath(value, keyPath) {
+  if (!keyPath) return value;
+  return keyPath.split('.').reduce((current, key) => (current == null ? undefined : current[key]), value);
+}
+
+function setByPath(value, keyPath, newValue) {
+  if (!keyPath) return newValue;
+
+  const parts = keyPath.split('.');
+  const root = value && typeof value === 'object' ? (Array.isArray(value) ? [...value] : { ...value }) : {};
+  let current = root;
+
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const part = parts[index];
+    const next = current[part];
+    current[part] = Array.isArray(next) ? [...next] : { ...(next || {}) };
+    current = current[part];
+  }
+
+  current[parts[parts.length - 1]] = newValue;
+  return root;
+}
+
+async function readInputData(inputPath, inputFormat, jsonInputKey) {
+  if (inputFormat === 'json') {
+    const raw = await fs.readFile(inputPath, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    if (Array.isArray(parsed)) {
+      return parsed.map((item, index) => {
+        const itemType = item === null ? 'null' : typeof item;
+        if (!jsonInputKey && itemType === 'object') {
+          throw new Error('JSON array items are objects; use --json-input-key to choose the text field to translate');
+        }
+
+        const text = jsonInputKey ? getByPath(item, jsonInputKey) : item;
+        return {
+          type: 'json',
+          index,
+          item,
+          text: text == null ? '' : String(text),
+        };
+      });
+    }
+
+    if (parsed && typeof parsed === 'object') {
+      return Object.entries(parsed).map(([key, item]) => {
+        const itemType = item === null ? 'null' : typeof item;
+        if (!jsonInputKey && itemType === 'object') {
+          throw new Error(`JSON value for key "${key}" is an object; use --json-input-key to choose the text field to translate`);
+        }
+
+        const text = jsonInputKey ? getByPath(item, jsonInputKey) : item;
+        return {
+          type: 'json-object',
+          key,
+          item,
+          text: text == null ? '' : String(text),
+        };
+      });
+    }
+
+    throw new Error('JSON input must be an array or object');
+  }
+
+  const rawInput = await fs.readFile(inputPath, 'utf8');
+  return rawInput.split(/\r?\n/).map((text, index) => ({
+    type: 'txt',
+    index,
+    text,
+  }));
+}
+
+async function readExistingJsonOutput(outputPath) {
+  const raw = await fs.readFile(outputPath, 'utf8').catch(() => '');
+  if (!raw.trim()) {
+    return null;
+  }
+
+  return JSON.parse(raw);
+}
+
+function extractStoredTranslation(entry, jsonOutputKey) {
+  if (entry == null) {
+    return null;
+  }
+
+  if (typeof entry !== 'object') {
+    return String(entry);
+  }
+
+  const value = getByPath(entry, jsonOutputKey);
+  return value == null ? null : String(value);
+}
+
+async function writeJsonOutput(outputPath, inputData, translations, jsonOutputKey) {
+  const existing = await fs.readFile(outputPath, 'utf8').catch(() => '');
+  const parsedExisting = existing.trim() ? JSON.parse(existing) : null;
+
+  if (inputData.length && inputData[0].type === 'json') {
+    const output = inputData.map((entry, index) => {
+      const translatedText = translations[index];
+      return setByPath(entry.item, jsonOutputKey, translatedText);
+    });
+
+    await fs.writeFile(outputPath, `${JSON.stringify(output, null, 2)}\n`, 'utf8');
+    return;
+  }
+
+  if (inputData.length && inputData[0].type === 'json-object') {
+    const output = {};
+    inputData.forEach((entry, index) => {
+      output[entry.key] = setByPath(entry.item, jsonOutputKey, translations[index]);
+    });
+
+    await fs.writeFile(outputPath, `${JSON.stringify(output, null, 2)}\n`, 'utf8');
+    return;
+  }
+
+  if (parsedExisting && Array.isArray(parsedExisting)) {
+    await fs.writeFile(outputPath, `${JSON.stringify([...parsedExisting, ...translations], null, 2)}\n`, 'utf8');
+    return;
+  }
+
+  await fs.writeFile(outputPath, `${JSON.stringify(translations, null, 2)}\n`, 'utf8');
+}
+
+async function writeJsonIncremental(outputPath, entry, index, translatedText, jsonOutputKey) {
+  const value = setByPath(entry.item, jsonOutputKey, translatedText);
+  await appendPrettyJsonValue(outputPath, value);
+}
+
+async function appendPrettyJsonValue(outputPath, value) {
+  // Efficient incremental append: only read a small tail of the file to decide whether
+  // to replace the trailing newline with a comma/newline or append after the opening bracket.
+  const fh = await fs.open(outputPath, 'r+');
+  try {
+    const st = await fh.stat();
+    const size = st.size;
+    const lastChunkSize = Math.min(1024, Math.max(1, size));
+    let lastChar = null;
+    const prettyItem = JSON.stringify(value, null, 2)
+      .split('\n')
+      .map((line) => `  ${line}`)
+      .join('\n');
+
+    if (size === 0) {
+      // Shouldn't happen because prepareOutputFiles should write '[\n' for JSON, but handle anyway.
+      await fh.write(Buffer.from(`[\n${prettyItem}\n`));
+      return;
+    }
+
+    const readBuffer = Buffer.alloc(lastChunkSize);
+    await fh.read(readBuffer, 0, lastChunkSize, size - lastChunkSize);
+    // find last non-whitespace character
+    for (let i = readBuffer.length - 1; i >= 0; i -= 1) {
+      const ch = String.fromCharCode(readBuffer[i]);
+      if (!/\s/.test(ch)) {
+        lastChar = ch;
+        // compute absolute position of this char
+        const posOfLast = size - lastChunkSize + i;
+        if (lastChar === ']') {
+          // overwrite the trailing ']' with a comma/newline and then append item (leaving file unclosed)
+          const payload = `,\n${prettyItem}\n`;
+          await fh.write(Buffer.from(payload), 0, Buffer.byteLength(payload), posOfLast);
+          return;
+        }
+
+        // otherwise, replace the last newline with comma/newline and append the item.
+        if (lastChar === '[') {
+          const payload = `${prettyItem}\n`;
+          await fh.write(Buffer.from(payload), 0, Buffer.byteLength(payload), size);
+          return;
+        }
+
+        const payload = `,\n${prettyItem}\n`;
+        await fh.write(Buffer.from(payload), 0, Buffer.byteLength(payload), size - 1);
+        return;
+      }
+    }
+
+    // if we couldn't find a non-whitespace char in the tail, just append item
+    const payload = `${prettyItem}\n`;
+    await fh.write(Buffer.from(payload), 0, Buffer.byteLength(payload), size);
+  } finally {
+    await fh.close();
   }
 }
 
@@ -167,11 +401,19 @@ async function main() {
   const inputPath = path.resolve(process.cwd(), args.input);
   const outputPath = path.resolve(process.cwd(), args.output);
   const failedPath = path.resolve(process.cwd(), args.failed);
+  const inputFormat = inferFormat(inputPath, args.inputFormat);
+  const outputFormat = inferFormat(outputPath, args.outputFormat);
+  const repairDuplicates = Boolean(args.repairDuplicates && outputFormat === 'json');
 
-  const rawInput = await fs.readFile(inputPath, 'utf8');
-  const texts = rawInput.split(/\r?\n/);
+  const inputData = await readInputData(inputPath, inputFormat, args.jsonInputKey);
+  const existingJsonOutput = repairDuplicates ? await readExistingJsonOutput(outputPath) : null;
 
-  await prepareOutputFiles(outputPath, failedPath);
+  if (repairDuplicates) {
+    await ensureParentDir(outputPath);
+    await fs.writeFile(outputPath, '[\n', 'utf8');
+  } else {
+    await prepareOutputFiles(outputPath, failedPath, outputFormat);
+  }
 
   let browser = await chromium.launch({ headless: args.headless });
   let page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
@@ -194,30 +436,60 @@ async function main() {
   }
 
   try {
-    console.log(`Loaded ${texts.length} lines from ${inputPath}`);
-    console.log(`Writing translations to ${outputPath}`);
+    console.log(`Loaded ${inputData.length} items from ${inputPath} (${inputFormat})`);
+    console.log(`Writing translations to ${outputPath} (${outputFormat})`);
+    if (repairDuplicates) {
+      console.log('Repair mode enabled: duplicate translation blocks will be retranslated.');
+    }
 
-    for (const [index, originalText] of texts.entries()) {
-      const text = originalText.trim();
+    let lastStoredTranslation = null;
+
+    for (const [index, entry] of inputData.entries()) {
+      const originalText = entry.text ?? '';
+      const text = String(originalText).trim();
+
+      const storedEntry = repairDuplicates
+        ? (Array.isArray(existingJsonOutput)
+          ? existingJsonOutput[index]
+          : existingJsonOutput && typeof existingJsonOutput === 'object'
+            ? existingJsonOutput[entry.key]
+            : undefined)
+        : undefined;
+
+      const storedTranslation = repairDuplicates ? extractStoredTranslation(storedEntry, args.jsonOutputKey) : null;
+      const isDuplicate = repairDuplicates
+        && storedTranslation != null
+        && lastStoredTranslation != null
+        && storedTranslation === lastStoredTranslation;
+
+      if (repairDuplicates && storedEntry !== undefined && !isDuplicate) {
+        await appendPrettyJsonValue(outputPath, storedEntry);
+        lastStoredTranslation = storedTranslation;
+        continue;
+      }
 
       if (!text) {
-        await fs.appendFile(outputPath, '\n', 'utf8');
+        if (outputFormat === 'txt') {
+          await fs.appendFile(outputPath, '\n', 'utf8');
+        } else {
+          await writeJsonIncremental(outputPath, entry, index, null, args.jsonOutputKey);
+        }
         continue;
       }
 
       let translatedText = null;
       let lastError = null;
 
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
         try {
-          console.log(`[${index + 1}/${texts.length}] Translating (attempt ${attempt}): ${text}`);
+          console.log(`[${index + 1}/${inputData.length}] Translating (attempt ${attempt}): ${text}`);
           translatedText = await translateOnce(page, text, args.url, args.timeoutMs);
           break;
         } catch (error) {
           lastError = error;
           console.error(`Failed on attempt ${attempt}: ${error.message}`);
           // Attempt to clear state by restarting browser/page before next attempt
-          if (attempt < 3) {
+          if (attempt < 5) {
             console.log('Clearing cookies/cache by restarting browser and creating a fresh context...');
             const res = await restartBrowser(browser, args.headless);
             browser = res.newBrowser;
@@ -235,8 +507,8 @@ async function main() {
       }
 
       if (translatedText === null) {
-        console.error(`Giving up on line ${index + 1}`);
-        await fs.appendFile(failedPath, `${originalText}\n`, 'utf8');
+        console.error(`Giving up on item ${index + 1}`);
+        await fs.appendFile(failedPath, `${text}\n`, 'utf8');
         if (lastError) {
           console.error(lastError);
         }
@@ -244,15 +516,71 @@ async function main() {
       }
 
       console.log(`-> ${translatedText}`);
-      await fs.appendFile(outputPath, `${translatedText}\n`, 'utf8');
+      if (outputFormat === 'txt') {
+        await fs.appendFile(outputPath, `${translatedText}\n`, 'utf8');
+      } else {
+        await writeJsonIncremental(outputPath, entry, index, translatedText, args.jsonOutputKey);
+      }
+
+      if (repairDuplicates) {
+        lastStoredTranslation = translatedText;
+      }
+
       await delay(randomDelay(args.minDelayMs, args.maxDelayMs));
     }
+
+    // JSON output is written incrementally per item via writeJsonIncremental
   } finally {
     try {
       if (browser) await browser.close();
     } catch (e) {
       // ignore close errors
     }
+    // finalize JSON output if needed
+    try {
+      if (outputFormat === 'json') {
+        await finalizeOutputJson(outputPath).catch(() => {});
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+}
+
+async function finalizeOutputJson(outputPath) {
+  try {
+    const fh = await fs.open(outputPath, 'a+');
+    try {
+      const st = await fh.stat();
+      const size = st.size;
+      if (size === 0) {
+        await fh.write('[]\n');
+        return;
+      }
+
+      const lastChunkSize = Math.min(1024, size);
+      const buf = Buffer.alloc(lastChunkSize);
+      await fh.read(buf, 0, lastChunkSize, size - lastChunkSize);
+      let lastChar = null;
+      for (let i = buf.length - 1; i >= 0; i -= 1) {
+        const ch = String.fromCharCode(buf[i]);
+        if (!/\s/.test(ch)) {
+          lastChar = ch;
+          break;
+        }
+      }
+
+      if (lastChar === ']') {
+        return; // already closed
+      }
+
+      // append closing bracket
+      await fh.write(']\n');
+    } finally {
+      await fh.close();
+    }
+  } catch (e) {
+    // ignore finalize errors
   }
 }
 
