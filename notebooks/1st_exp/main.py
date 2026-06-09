@@ -1,38 +1,88 @@
+# %% [markdown]
+# # fIRST rUN
+
+# %%
+# paket-pakettttt
+# %pip install pandas numpy matplotlib seaborn scikit-learn transformers torch torchinfo torchvision timm gdown
+
+import gdown
+import os
+from pathlib import Path
+
+# %%
+cwd = Path.cwd()
+project_root_dir = cwd.parents[1]
+dataset_root_dir = project_root_dir / "datasets"
+
+### modifiable
+dataset_name = "MMSD2.0" # ganti dataset lewat sini
+dataset_dir = dataset_root_dir / dataset_name
+dataset_data_dir = dataset_dir / "data"
+###
+
+# symlink
+project_dataset_dir = cwd / "dataset"
+if not project_dataset_dir.exists():
+    project_dataset_dir.symlink_to(dataset_data_dir)
+
+# %%
+# donwload MMSD2.0 images
+gdown.download(url='https://drive.google.com/uc?id=1mK0Nf-jv_h2bgHUCRM4_EsdTiiitZ_Uj', output=project_dataset_dir.as_posix(), quiet=False)
+gdown.download(url='https://drive.google.com/uc?id=1AOWzlOz5hmdO39dEmzhQ4z_nabgzi7Tu', output=project_dataset_dir.as_posix(), quiet=False)
+gdown.download(url='https://drive.google.com/uc?id=1dJERrVlp7DlNSXk-uvbbG6Rv7uvqTOKd', output=project_dataset_dir.as_posix(), quiet=False)
+gdown.download(url='https://drive.google.com/uc?id=1pODuKC4gP6-QDQonG8XTqI8w8ds68mE3', output=project_dataset_dir.as_posix(), quiet=False)
+
+# pastiin udh install 7z dari package manager
+!7z x ./dataset/dataset_image.zip -o./dataset
+
+# %%
+# download whitelist
+gdown.download("https://drive.google.com/file/d/18yU3HaSvBNYml2EfKn-uG7vUKXGDMt6d/view?usp=drive_link", output=project_dataset_dir.as_posix(), quiet=False)
+
+# %% [markdown]
+# # Data Processing
+
 # %%
 import pandas as pd
 import numpy as np
+import random
 
 from transformers import AutoTokenizer, AutoProcessor, AutoModel, AlbertTokenizer, AlbertModel
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+from sklearn.utils.class_weight import compute_class_weight
 
 from torchinfo import summary
 from torch import nn
 import timm
 
 # %%
-df = pd.read_csv("./dataset/dataset_translated.csv", delimiter=";", encoding="utf-8", dtype={"image_id": str, "label": int})
-
+df = pd.read_json("./dataset/text_json_id/dataset_translated_fixed.json", orient="records", dtype={"image_id": str, "label": int})
 df.head()
 
 # %%
-#show some stats
-print(df.describe())
-print(df.info())
+# whitelist itu list gambar yang gk dominan teksnya
+
+with open("./dataset/whitelist.txt", "r") as f:
+    whitelist = set(line.strip()[:-4] for line in f)
+
+df = df[df["image_id"].isin(whitelist)]
 
 # %%
-#check the target distribution
-print(df['label'].value_counts())
+print(df.describe())
+print(df.info())
+print(df.value_counts(['split', 'label']))
 
 # %%
 # drop NaN values
-df = df.dropna()
+# df = df.dropna()
 
 # drop rows with missing image in ./dataset/dataset_image/<image_id>.jpg
 def check_image_exists(image_id):
     try:
         img = Image.open(f"./dataset/dataset_image/{image_id}.jpg")
+        del img
         return True
     except FileNotFoundError:
         print(f"Image {image_id} not found.")
@@ -43,24 +93,24 @@ df['image_exists'] = df['image_id'].apply(check_image_exists)
 print(df['image_exists'].value_counts())
 
 # %%
-df.head()
+# # random data
+# random_row = df.sample(n=1).iloc[0]
+# print(f"Text: {random_row['text_translated']}")
+# print(f"Label: {random_row['label']}")
+# img = Image.open(f"./dataset/dataset_image/{random_row['image_id']}.jpg")
+# img.show()
 
-# %%
-# show some random data with the image
-import random
-random_row = df.sample(n=1).iloc[0]
-print(f"Text: {random_row['text']}")
-print(f"Label: {random_row['label']}")
-img = Image.open(f"./dataset/dataset_image/{random_row['image_id']}.jpg")
-img.show()
 
 # %% [markdown]
-# # POC
+# # Experiment
 
 # %%
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # device = torch.device("cpu")
 print(f"Using device: {device}")
+
+# %%
+torch.cuda.set_device(1)
 
 # %%
 class SimpleSarcasmDataset(Dataset):
@@ -87,6 +137,21 @@ class SimpleSarcasmDataset(Dataset):
         }
 
 # %%
+# Source - https://stackoverflow.com/a/58612961
+# Posted by Szymon Maszke, modified by community. See post 'Timeline' for change history
+# Retrieved 2026-06-02, License - CC BY-SA 4.0
+
+class PandasDataset(Dataset):
+    def __init__(self, dataframe):
+        self.dataframe = dataframe
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, index):
+        return self.dataframe.iloc[index]
+
+# %%
 #dataset split
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
@@ -96,14 +161,39 @@ indices = list(range(len(df)))
 labels = df.label
 
 # Split indices (stratify=labels ensures both sets have the same class proportions)
-train_indices, val_indices = train_test_split(indices, test_size=0.3, stratify=labels)
+train_indices, val_test_indices = train_test_split(indices, test_size=0.4, stratify=labels)
+
+labels_test_val = labels.iloc[val_test_indices].tolist()
+val_indices, test_indices = train_test_split(val_test_indices, test_size=0.5, stratify=labels_test_val)
 
 # Create virtual subsets using these indices
 train_dataset_subset = Subset(df, train_indices)
 val_dataset_subset = Subset(df, val_indices)
+test_dataset_subset = Subset(df, test_indices)
 
 # %%
-text_model_name = "indobenchmark/indobert-lite-base-p2"
+print(df.iloc[train_dataset_subset.indices].value_counts(['split', 'label']))
+print(df.iloc[val_dataset_subset.indices].value_counts(['split', 'label']))
+print(df.iloc[test_dataset_subset.indices].value_counts(['split', 'label']))
+
+# %%
+# 1. Set global seeds
+torch.manual_seed(42)
+
+# 2. Create a local generator with a specific seed
+g = torch.Generator()
+g.manual_seed(42)
+
+# train_dataset = PandasDataset(df[df["split"] == "train"])
+# val_dataset = PandasDataset(df[df["split"] == "valid"])
+# test_dataset = PandasDataset(df[df["split"] == "test"])
+
+train_dataset = PandasDataset(df.iloc[train_dataset_subset.indices])
+val_dataset = PandasDataset(df.iloc[val_dataset_subset.indices])
+test_dataset = PandasDataset(df.iloc[test_dataset_subset.indices])
+
+# %%
+text_model_name = "indobenchmark/indobert-base-p2"
 # vision_model_name = "WinKawaks/vit-small-patch16-224"
 vision_model_name = "google/vit-base-patch16-224"
 
@@ -115,12 +205,11 @@ print(f"Vocab size: {tokenizer.vocab_size}")
 
 dummy_text = "Contoh teks untuk tokenisasi."
 encoded = tokenizer(dummy_text, return_tensors="pt", padding='max_length', truncation=True, max_length=128)
-print(encoded)
 
 print(f"Input IDs shape: {encoded['input_ids'].shape}")
 
 # reverse tokenization
-decoded_text = tokenizer.decode(encoded['input_ids'][0], skip_special_tokens=False)
+decoded_text = tokenizer.decode(encoded['input_ids'][0], skip_special_tokens=True)
 print(f"Decoded text: {decoded_text}")
 
 # %%
@@ -142,15 +231,9 @@ print(f"Processed image shape: {pixel_values.shape}")
 # Likely [1, 3, 224, 224]
 
 # %%
-# 1. Set global seeds
-torch.manual_seed(42)
-
-# 2. Create a local generator with a specific seed
-g = torch.Generator()
-g.manual_seed(42)
-
-train_dataset = DataLoader(SimpleSarcasmDataset(train_dataset_subset.dataset.to_dict(orient='records'), tokenizer, processor), batch_size=8, shuffle=True, generator=g)
-val_dataset = DataLoader(SimpleSarcasmDataset(val_dataset_subset.dataset.to_dict(orient='records'), tokenizer, processor), batch_size=8, shuffle=False)
+train_dataloader = DataLoader(SimpleSarcasmDataset(train_dataset, tokenizer, processor), batch_size=32, shuffle=True, generator=g)
+valid_dataloader = DataLoader(SimpleSarcasmDataset(val_dataset, tokenizer, processor), batch_size=32, shuffle=False)
+test_dataloader = DataLoader(SimpleSarcasmDataset(test_dataset, tokenizer, processor), batch_size=32, shuffle=False)
 
 # %%
 class SarcasmModel(nn.Module):
@@ -209,7 +292,7 @@ model = SarcasmModel(text_model, vision_model).to(device)
 
 # %%
 # Define dummy inputs that match the shapes you found above
-batch_size = 8
+batch_size = 32
 seq_len = 128 # or tokenizer.model_max_length
 img_size = 224
 
@@ -233,9 +316,11 @@ criterion = nn.BCELoss()
 epochs = 10
 for t in range(epochs):
     model.train()
-    correct = 0
-    total = 0
-    for item in train_dataset:
+    correct_train = 0
+    total_train = 0
+    loss_train = 0.0
+    for item in train_dataloader:
+        model.train()
         input_ids = item['input_ids'].to(device)
         pixel_values = item['pixel_values'].to(device)
         label = item['label'].to(device)
@@ -256,26 +341,49 @@ for t in range(epochs):
         output = torch.sigmoid(output_logits)
 
         pred = (output > 0.5).float()
-        correct += (pred == fixed_label).sum().item()
-        total += fixed_label.size(0)
+
         # print(f"Output: {output.item():.4f}, Label: {label.item():.0f}")
         # print(f"Output[0]: {output[0].item():.4f}, Label[0]: {label[0].item():.0f}")
         loss = criterion(output, fixed_label.view_as(output))
+
+        correct_train += (pred == fixed_label).sum().item()
+        total_train += fixed_label.size(0)
+        loss_train += loss.item() * fixed_label.size(0)
         
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
 
-        # free up memory
-        del input_ids
-        del pixel_values
-        del label
-        del fixed_input_ids
-        del fixed_pixel_values
-        del fixed_label
-    epoch_acc = 100 * correct / total
+    model.eval()
+    correct_valid = 0
+    total_valid = 0
+    loss_valid = 0.0
+    with torch.no_grad():
+        for item in valid_dataloader:
+            input_ids = item['input_ids'].to(device)
+            pixel_values = item['pixel_values'].to(device)
+            label = item['label'].to(device)
 
-    print(f'Epoch [{t+1}/{epochs}], Correst: {correct}, Total: {total}, Loss: {loss.item():.4f}, Accuracy: {epoch_acc:.2f}%')
+            fixed_input_ids = input_ids.squeeze(1)          # [B, 128]
+            fixed_pixel_values = pixel_values.squeeze(1)    # [B, 3, 224, 224]
+            fixed_label = label.unsqueeze(1)     # [B, 1]
+
+            output_logits, weights = model(fixed_input_ids, fixed_pixel_values)
+            output = torch.sigmoid(output_logits)
+
+            pred = (output > 0.5).float()
+            loss = criterion(output, fixed_label.view_as(output))
+
+            correct_valid += (pred == fixed_label).sum().item()
+            total_valid += fixed_label.size(0)
+            loss_valid += loss.item() * fixed_label.size(0)
+
+
+    epoch_train_acc = 100 * correct_train / total_train
+    epoch_valid_acc = 100 * correct_valid / total_valid
+    epoch_train_loss = loss_train / total_train
+    epoch_valid_loss = loss_valid / total_valid
+    print(f'Epoch [{t+1}/{epochs}] Train Loss: {epoch_train_loss:.4f}, Train Accuracy: {epoch_train_acc:.2f}%, Valid Loss: {epoch_valid_loss:.4f}, Valid Accuracy: {epoch_valid_acc:.2f}%')
 
 # %%
 import matplotlib.pyplot as plt
@@ -332,7 +440,7 @@ total = 0
 preview_count = 0
 max_previews = 10
 with torch.no_grad():
-    for item in val_dataset:
+    for item in test_dataloader:
         input_ids = item['input_ids'].to(device)
         pixel_values = item['pixel_values'].to(device)
         label = item['label'].to(device)
@@ -361,7 +469,6 @@ with torch.no_grad():
 
                 print(f"True: {fixed_label[rand_idx].item():.0f}, Pred: {pred[rand_idx].item():.0f}")
                 print(f"Text: {tokenizer.decode(fixed_input_ids[rand_idx], skip_special_tokens=True)}")
-                print(fixed_input_ids[rand_idx])
 
                 # weights shape: [B, 1, 196] -> take sample and squeeze the seq dim
                 attn_sample = weights[rand_idx].squeeze(0)
@@ -373,20 +480,25 @@ with torch.no_grad():
                 #     print(f"Text: {tokenizer.decode(fixed_input_ids[i], skip_special_tokens=True)}")
                 #     plot_attention_map(fixed_pixel_values[i], weights[i], title=f"True: {fixed_label[i].item():.0f}, Pred: {pred[i].item():.0f}")
 epoch_acc = 100 * correct / total
-print(f'Validation Accuracy: {epoch_acc:.2f}%')
+print(f'Test Accuracy: {epoch_acc:.2f}%')
 
 # %%
-# # try to do some inference from external data
-# image = Image.open("./images.jpeg").convert("RGB")
-# image_inputs = processor(images=image, return_tensors="pt").to(device)
-# text_inputs = tokenizer("Wah kamarnya sangat rapi, kamu pasti sangat rajin membersihkan", return_tensors="pt", padding='max_length', truncation=True, max_length=128).to(device)
+# try to do some inference from external data
+image = Image.open("./messy_room.jpg").convert("RGB")
+image_inputs = processor(images=image, return_tensors="pt").to(device)
+text_inputs = tokenizer("kamarmu bersih sekali, kamu pasti rajin membersihkannya", return_tensors="pt", padding='max_length', truncation=True, max_length=128).to(device)
 
-# model.eval()
-# with torch.no_grad():
-#     output = model(text_inputs['input_ids'], image_inputs['pixel_values'])
-#     print(f"Inference Output: {output.item():.4f}")
-#     pred = (output > 0.5).float()
-#     print(f"Inference Prediction: {'Sarcastic' if pred.item() == 1 else 'Not Sarcastic'}")
+model.eval()
+with torch.no_grad():
+    output_logits, weights = model(text_inputs['input_ids'], image_inputs['pixel_values'])
+    output = torch.sigmoid(output_logits)
+    print(f"Inference Output: {output}")
+    pred = (output > 0.5).float()
+    print(f"Inference Prediction: {'Sarcastic' if pred.item() == 1 else 'Not Sarcastic'}")
+
+    attn_sample = weights[0].squeeze(0)
+
+    plot_attention_map(image_inputs['pixel_values'][0], weights[0])
 
 # %%
 
