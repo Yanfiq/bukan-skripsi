@@ -1,9 +1,24 @@
+# ---
+# jupyter:
+#   jupytext:
+#     formats: ipynb,py:percent
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.3
+#   kernelspec:
+#     display_name: 1st-exp (3.12.11.final.0)
+#     language: python
+#     name: python3
+# ---
+
 # %% [markdown]
 # # fIRST rUN
 
 # %%
 # paket-pakettttt
-# %pip install pandas numpy matplotlib seaborn scikit-learn transformers torch torchinfo torchvision timm gdown
+# # %pip install pandas numpy matplotlib seaborn scikit-learn transformers torch torchinfo torchvision timm gdown
 
 import gdown
 import os
@@ -74,6 +89,7 @@ print(df.describe())
 print(df.info())
 print(df.value_counts(['split', 'label']))
 
+
 # %%
 # drop NaN values
 # df = df.dropna()
@@ -112,6 +128,7 @@ print(f"Using device: {device}")
 # %%
 torch.cuda.set_device(1)
 
+
 # %%
 class SimpleSarcasmDataset(Dataset):
     def __init__(self, data, tokenizer, processor):
@@ -136,6 +153,7 @@ class SimpleSarcasmDataset(Dataset):
             'label': torch.tensor(item['label'], dtype=torch.float)
         }
 
+
 # %%
 # Source - https://stackoverflow.com/a/58612961
 # Posted by Szymon Maszke, modified by community. See post 'Timeline' for change history
@@ -150,6 +168,7 @@ class PandasDataset(Dataset):
 
     def __getitem__(self, index):
         return self.dataframe.iloc[index]
+
 
 # %%
 #dataset split
@@ -235,6 +254,7 @@ train_dataloader = DataLoader(SimpleSarcasmDataset(train_dataset, tokenizer, pro
 valid_dataloader = DataLoader(SimpleSarcasmDataset(val_dataset, tokenizer, processor), batch_size=32, shuffle=False)
 test_dataloader = DataLoader(SimpleSarcasmDataset(test_dataset, tokenizer, processor), batch_size=32, shuffle=False)
 
+
 # %%
 class SarcasmModel(nn.Module):
     def __init__(self, text_model, vision_model):
@@ -283,6 +303,7 @@ class SarcasmModel(nn.Module):
         logits = self.classifier(fused.squeeze(1))
         
         return logits, attn_weights
+
 
 # %%
 text_model = AutoModel.from_pretrained(text_model_name)
@@ -390,6 +411,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import cv2
 
+
 # %%
 def plot_attention_map(image_tensor, attn_weights, title="Attention Map"):
     """
@@ -431,6 +453,7 @@ def plot_attention_map(image_tensor, attn_weights, title="Attention Map"):
 
 # Example usage:
 # plot_attention_map(pixel_values[0], weights[0])
+
 
 # %%
 #test
@@ -502,8 +525,4 @@ with torch.no_grad():
 
 # %%
 
-
 # %%
-
-
-
