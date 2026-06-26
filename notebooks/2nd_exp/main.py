@@ -6,9 +6,9 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.19.3
+#       jupytext_version: 1.19.4
 #   kernelspec:
-#     display_name: 2nd-exp (3.12.11.final.0)
+#     display_name: .venv
 #     language: python
 #     name: python3
 # ---
@@ -26,7 +26,8 @@ class BlankObject:
 params = BlankObject()
 params.text_model_name = "indobenchmark/indobert-base-p2"
 # params.text_model_name = "bert-base-uncased"
-params.vision_model_name = "openai/clip-vit-base-patch32"
+# params.vision_model_name = "openai/clip-vit-base-patch32"
+params.vision_model_name = "Galuh/clip-indonesian"
 params.device = 1
 params.simple_linear = False
 params.text_size = 512
@@ -34,8 +35,8 @@ params.layers = 3
 params.dropout_rate = 0.1
 params.image_size = 768
 params.num_train_epochs = 10
-params.train_batch_size = 1
-params.dev_batch_size = 1
+params.train_batch_size = 64
+params.dev_batch_size = 64
 params.max_len = 77
 params.label_count = 2
 params.output_dir = "./saved_models"
@@ -87,7 +88,6 @@ class MMSD2_id_dataset(Dataset):
             self.data[id]["image_path"] = dataset_dir / "dataset_image" / f"{id}.jpg"
 
     def image_loader(self,id):
-        print(f"Loading image from: {self.data[id]['image_path']}")
         return Image.open(self.data[id]["image_path"])
     
     def text_loader(self,id):
@@ -95,7 +95,6 @@ class MMSD2_id_dataset(Dataset):
 
     def __getitem__(self, index):
         id=self.image_ids[index]
-        print(f"Loading data for ID: {id} (index: {index})")
         text = self.text_loader(id)
         image_feature = self.image_loader(id)
         label = self.data[id]["label"]
@@ -170,7 +169,7 @@ test_dataset = MMSD2_id_dataset(df[df["split"] == "test"])
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoProcessor, AutoModel, AlbertTokenizer, AlbertModel
-from transformers import CLIPVisionModel
+from transformers import CLIPVisionModel, HybridCLIP
 from torchinfo import summary
 from torch import nn
 from transformers import CLIPModel,BertConfig
@@ -179,8 +178,8 @@ import copy
 from sklearn import metrics
 
 # %%
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cpu")
 print(f"Using device: {device}")
 
 
@@ -191,22 +190,40 @@ print(f"Using device: {device}")
 class MultimodalEncoder(nn.Module):
     def __init__(self, config, layer_number):
         super(MultimodalEncoder, self).__init__()
-        layer = BertLayer(config)
-        self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(layer_number)])
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_size,       # 768
+            nhead=config.num_attention_heads, # 12
+            dim_feedforward=config.intermediate_size,  # 3072
+            dropout=config.hidden_dropout_prob,
+            activation='gelu',
+            batch_first=True,                 # [B, seq, dim] convention
+            norm_first=False
+        )
+        self.layer = nn.ModuleList([
+            copy.deepcopy(encoder_layer) for _ in range(layer_number)
+        ])
 
     def forward(self, hidden_states, attention_mask, output_all_encoded_layers=True):
         all_encoder_layers = []
-        all_encoder_attentions = []
+
+        # nn.TransformerEncoderLayer expects mask as additive float [B, seq, seq]
+        # or key_padding_mask as bool [B, seq]
+        # Your attention_mask coming in is [B, 1, 1, seq] additive float — convert it:
+        # squeeze to [B, seq], then invert to key_padding_mask (True = ignore)
+        key_padding_mask = (attention_mask.squeeze(1).squeeze(1) == -10000.0)
+
         for layer_module in self.layer:
-            layer_outputs = layer_module(hidden_states, attention_mask, output_attentions=True)
-            hidden_states = layer_outputs[0]
-            attention = layer_outputs[1] if len(layer_outputs) > 1 else None
-            all_encoder_attentions.append(attention)
+            hidden_states = layer_module(
+                hidden_states,
+                src_key_padding_mask=key_padding_mask
+            )
             if output_all_encoded_layers:
                 all_encoder_layers.append(hidden_states)
+
         if not output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
-        return all_encoder_layers, all_encoder_attentions
+
+        return all_encoder_layers, None  # None = no attention weights returned
     
 class SarcasmModel(nn.Module):
     def __init__(self, params):
@@ -219,8 +236,7 @@ class SarcasmModel(nn.Module):
         # 2. Use IndoBERT's config for the fusion transformer (768 dimensions)
         self.config = self.text_model.config
         self.config.num_hidden_layers = params.layers
-
-        self.config._attn_implementation = "eager"
+        # self.config._attn_implementation = "eager"
         
         self.trans = MultimodalEncoder(self.config, layer_number=params.layers)
         
@@ -262,47 +278,33 @@ class SarcasmModel(nn.Module):
         image_feature = self.image_linear(image_feature)
 
         # 3. Multimodal Fusion Preparation
-        # Directly concatenate the 768D sequences (no projection needed!)
+        # Directly concatenate the 768D sequences
         input_embeds = torch.cat((image_features, text_features), dim=1)
         
-        # Dynamic sequence length for images (fixes the hardcoded 50 bug)
+        # Dynamic sequence length for images
         vision_seq_len = image_features.shape[1]
         vision_mask = torch.ones(text_features.shape[0], vision_seq_len, device=text_features.device)
         concat_mask = torch.cat((vision_mask, attention_mask), dim=-1)
         
-        extended_attention_mask = concat_mask[:, None, None, :]  # [B, 1, 1, seq_len]
-        extended_attention_mask = extended_attention_mask.expand(
-            -1, -1, concat_mask.shape[-1], -1          # [B, 1, seq_len, seq_len]
-        ).contiguous()
-        # extended_attention_mask = concat_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = concat_mask.unsqueeze(1).unsqueeze(2)
         extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         # 4. Multimodal Fusion Pass
         combined_seq_len = input_embeds.shape[1]
         mask_seq_len = concat_mask.shape[-1]
-
-        assert combined_seq_len == mask_seq_len, (
-            f"Sequence length mismatch: input_embeds={combined_seq_len}, "
-            f"concat_mask={mask_seq_len}\n"
-            f"  image_features.shape={image_features.shape}\n"
-            f"  text_features.shape={text_features.shape}\n"
-            f"  vision_mask.shape={vision_mask.shape}\n"
-            f"  attention_mask.shape={attention_mask.shape}"
-        )
         
         fuse_hiddens, all_attentions = self.trans(input_embeds, extended_attention_mask, output_all_encoded_layers=False)
         fuse_hiddens = fuse_hiddens[-1]
         
         # Extract the fused text and image representations
         new_text_features = fuse_hiddens[:, vision_seq_len:, :]
-        # new_text_feature = new_text_features[
-        #     torch.arange(new_text_features.shape[0], device=input_ids.device), 
-        #     input_ids.to(torch.int).argmax(dim=-1)
-        # ]
-        new_text_feature = new_text_features[:, 0, :]
+        new_text_feature = new_text_features[
+            torch.arange(new_text_features.shape[0], device=input_ids.device), 
+            input_ids.to(torch.int).argmax(dim=-1)
+        ]
         
-        # Extract image [CLS] token (fixes the squeeze bug)
+        # Extract image [CLS] token
         new_image_feature = fuse_hiddens[:, 0, :]
 
         # 5. Attention-based Weighting
@@ -337,7 +339,59 @@ class SarcasmModel(nn.Module):
 
 
 # %% [markdown]
-# #### Hide
+# # Train
+
+# %%
+from tqdm import tqdm, trange
+
+# %%
+train_loader = DataLoader(dataset=train_dataset,
+                              batch_size=params.train_batch_size,
+                              collate_fn=MMSD2_id_dataset.collate_func,
+                              shuffle=True)
+
+model = SarcasmModel(params).to(device)
+
+# %%
+del model
+torch.cuda.empty_cache()
+
+# %%
+# clip_params = list(map(id, model.parameters()))
+# base_params = filter(lambda p: id(p) not in clip_params, model.parameters())
+# optimizer = ada([
+#         {"params": base_params},
+#         {"params": model.model.parameters(),"lr": args.clip_learning_rate}
+#         ], lr=args.learning_rate, weight_decay=args.weight_decay)
+# optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+# scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(args.warmup_proportion * total_steps),
+#                                         num_training_steps=total_steps)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+processor = AutoProcessor.from_pretrained(params.vision_model_name)
+tokenizer = AutoTokenizer.from_pretrained(params.text_model_name)
+
+
+# %%
+# # 1. See what the model expects for dimensions
+# print(f"Expected size: {processor.image_processor.size}") 
+
+# # 2. See normalization values (Mean and Std)
+# print(f"Mean: {processor.image_processor.image_mean}")
+# print(f"Std: {processor.image_processor.image_std}")
+
+# # 3. Check the output shape with a dummy image (e.g., a random tensor)
+# import torch
+# dummy_image = torch.randn(3, 500, 500) # Simulating a 500x500 RGB image
+# # Rescale dummy_image to [0,1], convert to PIL, then process
+# img = dummy_image.clone().cpu()
+# img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+# np_img = (img.permute(1, 2, 0).mul(255).to(torch.uint8).numpy())
+# pil_img = Image.fromarray(np_img)
+# pixel_values = processor(images=pil_img, return_tensors="pt")["pixel_values"]
+
+# print(f"Processed image shape: {pixel_values.shape}")
+# # Likely [1, 3, 224, 224]
 
 # %%
 def evaluate_acc_f1(params, model, device, data, processor, macro=False,pre = None, mode='test'):
@@ -351,11 +405,16 @@ def evaluate_acc_f1(params, model, device, data, processor, macro=False,pre = No
         with torch.no_grad():
             for i_batch, t_batch in enumerate(data_loader):
                 text_list, image_list, label_list, id_list = t_batch
-                inputs = processor(text=text_list, images=image_list, padding='max_length', truncation=True, max_length=params.max_len, return_tensors="pt").to(device)
+                text_inputs = tokenizer(text_list, padding='max_length', truncation=True, max_length=params.max_len, return_tensors="pt").to(device)
+                image_inputs = processor(images=image_list, return_tensors="pt").to(device)
                 labels = torch.tensor(label_list).to(device)
+
+                input_ids = text_inputs['input_ids']
+                attention_mask = text_inputs['attention_mask']
+                pixel_values = image_inputs['pixel_values']
                 
                 t_targets = labels
-                loss, t_outputs = model(inputs,labels=labels)
+                loss, t_outputs = model(input_ids=input_ids, attention_mask=attention_mask, pixel_values=pixel_values, labels=labels)
                 sum_loss += loss.item()
                 sum_step += 1
   
@@ -394,56 +453,6 @@ def evaluate_acc_f1(params, model, device, data, processor, macro=False,pre = No
             recall = metrics.recall_score(t_targets_all.cpu(),t_outputs_all.cpu(), labels=[0, 1],average='macro')
         return acc, f1 ,precision,recall
 
-
-# %% [markdown]
-# # Train
-
-# %%
-from tqdm import tqdm, trange
-
-# %%
-# train_loader = DataLoader(dataset=train_dataset,
-#                               batch_size=params.train_batch_size,
-#                               collate_fn=MMSD2_id_dataset.collate_func,
-#                               shuffle=True)
-
-model = SarcasmModel(params).to(device)
-
-# %%
-# clip_params = list(map(id, model.parameters()))
-# base_params = filter(lambda p: id(p) not in clip_params, model.parameters())
-# optimizer = ada([
-#         {"params": base_params},
-#         {"params": model.model.parameters(),"lr": args.clip_learning_rate}
-#         ], lr=args.learning_rate, weight_decay=args.weight_decay)
-# optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-# scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(args.warmup_proportion * total_steps),
-#                                         num_training_steps=total_steps)
-
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-processor = AutoProcessor.from_pretrained(params.vision_model_name)
-tokenizer = AutoTokenizer.from_pretrained(params.text_model_name)
-
-# %%
-# # 1. See what the model expects for dimensions
-# print(f"Expected size: {processor.image_processor.size}") 
-
-# # 2. See normalization values (Mean and Std)
-# print(f"Mean: {processor.image_processor.image_mean}")
-# print(f"Std: {processor.image_processor.image_std}")
-
-# # 3. Check the output shape with a dummy image (e.g., a random tensor)
-# import torch
-# dummy_image = torch.randn(3, 500, 500) # Simulating a 500x500 RGB image
-# # Rescale dummy_image to [0,1], convert to PIL, then process
-# img = dummy_image.clone().cpu()
-# img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-# np_img = (img.permute(1, 2, 0).mul(255).to(torch.uint8).numpy())
-# pil_img = Image.fromarray(np_img)
-# pixel_values = processor(images=pil_img, return_tensors="pt")["pixel_values"]
-
-# print(f"Processed image shape: {pixel_values.shape}")
-# # Likely [1, 3, 224, 224]
 
 # %%
 max_acc = 0.
