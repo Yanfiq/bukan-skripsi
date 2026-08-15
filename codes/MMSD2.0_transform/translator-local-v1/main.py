@@ -68,36 +68,52 @@ def load_records(input_path: Path):
     return data
 
 
-def translate_dataset(input_path: Path, output_path: Path, device: str, limit: int | None = None):
+def format_json_object(obj: dict) -> str:
+    formatted = json.dumps(obj, ensure_ascii=False, indent=2)
+    return "  " + formatted.replace("\n", "\n  ")
+
+
+def translate_dataset(input_path: Path, output_path: Path, device: str, limit: int | None = None, in_place: bool = False):
     records = load_records(input_path)
 
     if limit is not None:
         records = records[:limit]
 
+    final_output = input_path if in_place else output_path
+
     model, tokenizer = load_model_and_tokenizer(device)
     model.eval()
 
-    translated_records = []
-    for idx, record in enumerate(records, start=1):
-        if not isinstance(record, dict):
-            raise ValueError(f"Record at index {idx - 1} is not an object: {record!r}")
+    final_output.parent.mkdir(parents=True, exist_ok=True)
+    total_written = 0
+    with final_output.open("w", encoding="utf-8") as f:
+        f.write("[\n")
+        first = True
 
-        original_text = record.get("text")
-        new_record = dict(record)
+        for idx, record in enumerate(records, start=1):
+            if not isinstance(record, dict):
+                raise ValueError(f"Record at index {idx - 1} is not an object: {record!r}")
 
-        if isinstance(original_text, str):
-            translated_text = translate_text(model, tokenizer, original_text, device)
-            new_record["text_translated"] = translated_text
-        else:
-            new_record["text_translated"] = ""
+            original_text = record.get("text")
+            new_record = dict(record)
 
-        translated_records.append(new_record)
+            if isinstance(original_text, str):
+                translated_text = translate_text(model, tokenizer, original_text, device)
+                new_record["text_translated"] = translated_text
+            else:
+                new_record["text_translated"] = ""
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(translated_records, f, ensure_ascii=False, indent=2)
+            if not first:
+                f.write(",\n")
 
-    print(f"Saved {len(translated_records)} translated records to {output_path}")
+            f.write(format_json_object(new_record))
+            first = False
+            total_written += 1
+            f.flush()
+
+        f.write("\n]\n")
+
+    print(f"Saved {total_written} translated records to {final_output}")
 
 
 def parse_args():
@@ -114,12 +130,18 @@ def main():
     args = parse_args()
 
     input_path = args.input
-    output_path = args.input if args.in_place else args.output
+    output_path = args.output
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input file does not exist: {input_path}")
 
-    translate_dataset(input_path=input_path, output_path=output_path, device=args.device, limit=args.limit)
+    translate_dataset(
+        input_path=input_path,
+        output_path=output_path,
+        device=args.device,
+        limit=args.limit,
+        in_place=args.in_place,
+    )
 
 
 if __name__ == "__main__":
