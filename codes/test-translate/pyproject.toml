@@ -3,15 +3,20 @@ name = "test-t5-translate"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.14.0",
+    "autoawq>=0.2.9",
+    "autoawq-kernels>=0.0.9",
     "bitsandbytes>=0.50.0",
     "ctranslate2>=4.8.1",
+    "gptqmodel>=7.3.2",
     "huggingface-hub[cli]>=1.26.0",
     "protobuf>=7.35.1",
     "sentencepiece>=0.2.2",
     "tiktoken>=0.13.0",
     "torch>=2.13.0",
+    "torchvision>=0.28.0",
     "transformers>=5.14.1",
+    "vllm>=0.2.5",
 ]
