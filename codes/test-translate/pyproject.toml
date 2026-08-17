@@ -12,6 +12,7 @@ dependencies = [
     "ctranslate2>=4.8.1",
     "gptqmodel>=7.3.2",
     "huggingface-hub[cli]>=1.26.0",
+    "ollama>=0.3.3",
     "protobuf>=7.35.1",
     "sentencepiece>=0.2.2",
     "tiktoken>=0.13.0",
