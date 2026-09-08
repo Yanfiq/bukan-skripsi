@@ -8,106 +8,152 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.4
 #   kernelspec:
-#     display_name: .venv
+#     display_name: Python 3 (ipykernel)
 #     language: python
 #     name: python3
 # ---
+
+# %% [markdown]
+# ## JALANIN INI CUMA KALO ENVIRONMENTNYA DISPOSABLE (Remote Jupyter Server)
+
+# %%
+import gdown
+import shutil
+import subprocess
+from pathlib import Path
+import os
+
+# %%
+subprocess.run(["pip", "install", "torch", "transformers", "gdown", "multilingual-clip", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo"])
+
+# %%
+# Optional: Install 7z if on Linux
+subprocess.run(["apt", "install", "-y", "p7zip-full"])
+
+# %%
+cwd = Path.cwd()
+project_root_dir = cwd.parents[1] if len(cwd.parents) >= 2 else cwd
+dataset_root_dir = project_root_dir / "datasets"
+
+# Symlink or set dataset directory
+dataset_dir = cwd / "dataset"
+if not dataset_dir.exists():
+    upstream_data_dir = dataset_root_dir / "MMSD2.0" / "data"
+    if upstream_data_dir.exists():
+        dataset_dir = upstream_data_dir
+    else:
+        # Clone if missing
+        subprocess.run(["git", "clone", "--depth", "1", "--no-checkout", "https://github.com/Yanfiq/MMSD2.0.git", "dataset"])
+        subprocess.run(["git", "sparse-checkout", "set", "data"], cwd=cwd / "dataset")
+        subprocess.run(["git", "checkout", "main"], cwd=cwd / "dataset")
+        data_dir = cwd / "dataset" / "data"
+        if data_dir.exists():
+            for item in data_dir.iterdir():
+                shutil.move(str(item), str(cwd / "dataset" / item.name))
+            data_dir.rmdir()
+
+# %% [markdown]
+# ### Download MMSD2.0 Images & Whitelist (if not already downloaded)
+
+# %%
+# Download MMSD2.0 image archives if dataset_image does not exist
+# if not (dataset_dir / "dataset_image").exists():
+gdown.download(url='https://drive.google.com/uc?id=1mK0Nf-jv_h2bgHUCRM4_EsdTiiitZ_Uj', output=str(dataset_dir) + "/", quiet=False)
+gdown.download(url='https://drive.google.com/uc?id=1AOWzlOz5hmdO39dEmzhQ4z_nabgzi7Tu', output=str(dataset_dir) + "/", quiet=False)
+gdown.download(url='https://drive.google.com/uc?id=1dJERrVlp7DlNSXk-uvbbG6Rv7uvqTOKd', output=str(dataset_dir) + "/", quiet=False)
+gdown.download(url='https://drive.google.com/uc?id=1pODuKC4gP6-QDQonG8XTqI8w8ds68mE3', output=str(dataset_dir) + "/", quiet=False)
+subprocess.run(["7z", "x", str(dataset_dir / "dataset_image.zip"), f"-o{dataset_dir}"])
+
+
+# %% [markdown]
+# ## Hyperparameters & Configuration
 
 # %%
 class BlankObject:
     pass
 
-
-# %%
-# text_model_name = "indobenchmark/indobert-base-p2"
-# # vision_model_name = "WinKawaks/vit-small-patch16-224"
-# vision_model_name = "openai/clip-vit-base-patch32"
-
 params = BlankObject()
-params.text_model_name = "indobenchmark/indobert-base-p2"
-# params.text_model_name = "bert-base-uncased"
-# params.vision_model_name = "openai/clip-vit-base-patch32"
-params.vision_model_name = "Galuh/clip-indonesian"
-params.device = 1
+params.text_model_name = "M-CLIP/LABSE-Vit-L-14"
+params.vision_model_name = "openai/clip-vit-large-patch14"
+params.device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") or __import__("torch").cuda.is_available() else "cpu"
 params.simple_linear = False
-params.text_size = 512
+params.fuse_dim = 768        # M-CLIP project dim and ViT-L-14 visual projection dim
+params.text_size = 768
+params.image_size = 768
 params.layers = 3
 params.dropout_rate = 0.1
-params.image_size = 768
 params.num_train_epochs = 10
 params.train_batch_size = 64
 params.dev_batch_size = 64
 params.max_len = 77
+params.learning_rate = 1e-4
 params.label_count = 2
+params.label_number = 2
 params.output_dir = "./saved_models"
-params.model = "sarcasm_model_v1"
+params.model = "sarcasm_model_mclip_v1"
 
 # %% [markdown]
-# # Dataset
+# # Dataset Loading & Preprocessing
 
 # %%
 import pandas as pd
 import numpy as np
 import random
-from torch.utils.data import Dataset
-import torch
-import os
 from PIL import Image
 from pathlib import Path
-
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer, AutoProcessor
 
 # %%
-cwd = Path.cwd()
-dataset_dir = cwd / "dataset"
-
-# %%
-df = pd.read_json("./dataset/text_json_id/dataset_translated_fixed.json", orient="records", dtype={"image_id": str, "label": int}).set_index("image_id")
+json_path = dataset_dir / "text_json_id" / "dataset_translated_fixed.json"
+df = pd.read_json(json_path, orient="records", dtype={"image_id": str, "label": int}).set_index("image_id")
 df.head()
 
 # %%
-# whitelist itu list gambar yang gk dominan teksnya
+# Filter out text-heavy images using whitelist
+whitelist_path = dataset_dir / "whitelist.txt"
+if whitelist_path.exists():
+    with open(whitelist_path, "r") as f:
+        whitelist = set(line.strip().replace(".jpg", "") for line in f if line.strip())
+    df = df[df.index.isin(whitelist)]
 
-with open("./dataset/whitelist.txt", "r") as f:
-    whitelist = set(line.strip()[:-4] for line in f)
-
-df = df[df["image_id"].isin(whitelist)]
-
-# %%
+print(f"Total samples after whitelist filtering: {len(df)}")
 print(df.describe())
 print(df.info())
 print(df.value_counts(['split', 'label']))
 
-
 # %%
 class MMSD2_id_dataset(Dataset):
-    def __init__(self, dataframe):
+    def __init__(self, dataframe, dataset_dir):
         self.data = dataframe.to_dict(orient="index")
-        self.image_ids=list(self.data.keys())
-        for id in self.data.keys():
-            self.data[id]["image_path"] = dataset_dir / "dataset_image" / f"{id}.jpg"
+        self.image_ids = list(self.data.keys())
+        self.dataset_dir = Path(dataset_dir)
+        for img_id in self.image_ids:
+            self.data[img_id]["image_path"] = self.dataset_dir / "dataset_image" / f"{img_id}.jpg"
 
-    def image_loader(self,id):
-        return Image.open(self.data[id]["image_path"])
-    
-    def text_loader(self,id):
-        return self.data[id]["text_translated"]
+    def image_loader(self, img_id):
+        img_path = self.data[img_id]["image_path"]
+        return Image.open(img_path).convert("RGB")
+
+    def text_loader(self, img_id):
+        return self.data[img_id]["text_translated"]
 
     def __getitem__(self, index):
-        id=self.image_ids[index]
-        text = self.text_loader(id)
-        image_feature = self.image_loader(id)
-        label = self.data[id]["label"]
-        return text,image_feature, label, id
+        img_id = self.image_ids[index]
+        text = self.text_loader(img_id)
+        image = self.image_loader(img_id)
+        label = self.data[img_id]["label"]
+        return text, image, label, img_id
 
     def __len__(self):
         return len(self.image_ids)
+
     @staticmethod
     def collate_func(batch_data):
-        batch_size = len(batch_data)
- 
-        if batch_size == 0:
-            return {}
+        if len(batch_data) == 0:
+            return [], [], [], []
 
         text_list = []
         image_list = []
@@ -120,211 +166,181 @@ class MMSD2_id_dataset(Dataset):
             id_list.append(instance[3])
         return text_list, image_list, label_list, id_list
 
+# %% [markdown]
+# ### Split Strategy: Default Upstream Split (Recommended)
+
+# %%
+train_dataset = MMSD2_id_dataset(df[df["split"] == "train"], dataset_dir)
+val_dataset = MMSD2_id_dataset(df[df["split"] == "valid"], dataset_dir)
+test_dataset = MMSD2_id_dataset(df[df["split"] == "test"], dataset_dir)
+
+print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
 
 # %% [markdown]
-# ### JALANIN INI KALO MAU CUSTOM SPLIT
+# ### (Alternative) Custom Stratified Split
 
 # %%
-from sklearn.model_selection import train_test_split
-from torch.utils.data import Subset
+# indices = list(range(len(df)))
+# labels = df.label
+# train_indices, val_test_indices = train_test_split(indices, test_size=0.4, stratify=labels, random_state=42)
+# labels_test_val = labels.iloc[val_test_indices].tolist()
+# val_indices, test_indices = train_test_split(val_test_indices, test_size=0.5, stratify=labels_test_val, random_state=42)
 
-# %%
-# Get all indices and labels
-indices = list(range(len(df)))
-labels = df.label
-
-# Split indices (stratify=labels ensures both sets have the same class proportions)
-train_indices, val_test_indices = train_test_split(indices, test_size=0.4, stratify=labels)
-
-labels_test_val = labels.iloc[val_test_indices].tolist()
-val_indices, test_indices = train_test_split(val_test_indices, test_size=0.5, stratify=labels_test_val)
-
-# Create virtual subsets using these indices
-train_dataset_subset = Subset(df, train_indices)
-val_dataset_subset = Subset(df, val_indices)
-test_dataset_subset = Subset(df, test_indices)
-
-# %%
-print(df.iloc[train_dataset_subset.indices].value_counts(['split', 'label']))
-print(df.iloc[val_dataset_subset.indices].value_counts(['split', 'label']))
-print(df.iloc[test_dataset_subset.indices].value_counts(['split', 'label']))
-
-# %%
-train_dataset = MMSD2_id_dataset(df.iloc[train_dataset_subset.indices])
-val_dataset = MMSD2_id_dataset(df.iloc[val_dataset_subset.indices])
-test_dataset = MMSD2_id_dataset(df.iloc[test_dataset_subset.indices])
+# train_dataset = MMSD2_id_dataset(df.iloc[train_indices], dataset_dir)
+# val_dataset = MMSD2_id_dataset(df.iloc[val_indices], dataset_dir)
+# test_dataset = MMSD2_id_dataset(df.iloc[test_indices], dataset_dir)
 
 # %% [markdown]
-# ### JALANIN INI KALO MAU DEFAULT SPLIT NGIKUT UPSTREAM
+# # Model Architecture: Multilingual CLIP Multimodal Fusion
 
 # %%
-train_dataset = MMSD2_id_dataset(df[df["split"] == "train"])
-val_dataset = MMSD2_id_dataset(df[df["split"] == "valid"])
-test_dataset = MMSD2_id_dataset(df[df["split"] == "test"])
-
-# %% [markdown]
-# # Model
-
-# %%
-import torch
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoProcessor, AutoModel, AlbertTokenizer, AlbertModel
-from transformers import CLIPVisionModel, HybridCLIP
-from torchinfo import summary
-from torch import nn
-from transformers import CLIPModel,BertConfig
-from transformers.models.bert.modeling_bert import BertLayer
 import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import BertConfig, CLIPVisionModelWithProjection
+from transformers.models.bert.modeling_bert import BertLayer
+from multilingual_clip import pt_multilingual_clip
 from sklearn import metrics
+from tqdm import tqdm, trange
 
 # %%
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# device = torch.device("cpu")
+# Reset default device to standard CPU to prevent meta-device errors from previous kernel runs
+if hasattr(torch, "set_default_device"):
+    torch.set_default_device(None)
+
+device = torch.device(params.device)
 print(f"Using device: {device}")
-
-
-# %%
-# torch.cuda.set_device(1)
 
 # %%
 class MultimodalEncoder(nn.Module):
     def __init__(self, config, layer_number):
         super(MultimodalEncoder, self).__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_size,       # 768
-            nhead=config.num_attention_heads, # 12
-            dim_feedforward=config.intermediate_size,  # 3072
-            dropout=config.hidden_dropout_prob,
-            activation='gelu',
-            batch_first=True,                 # [B, seq, dim] convention
-            norm_first=False
-        )
-        self.layer = nn.ModuleList([
-            copy.deepcopy(encoder_layer) for _ in range(layer_number)
-        ])
+        layer = BertLayer(config)
+        self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(layer_number)])
 
     def forward(self, hidden_states, attention_mask, output_all_encoded_layers=True):
         all_encoder_layers = []
-
-        # nn.TransformerEncoderLayer expects mask as additive float [B, seq, seq]
-        # or key_padding_mask as bool [B, seq]
-        # Your attention_mask coming in is [B, 1, 1, seq] additive float — convert it:
-        # squeeze to [B, seq], then invert to key_padding_mask (True = ignore)
-        key_padding_mask = (attention_mask.squeeze(1).squeeze(1) == -10000.0)
-
+        all_encoder_attentions = []
         for layer_module in self.layer:
-            hidden_states = layer_module(
-                hidden_states,
-                src_key_padding_mask=key_padding_mask
-            )
+            hidden_states, attention = layer_module(hidden_states, attention_mask, output_attentions=True)
+            all_encoder_attentions.append(attention)
             if output_all_encoded_layers:
                 all_encoder_layers.append(hidden_states)
-
         if not output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
+        return all_encoder_layers, all_encoder_attentions
 
-        return all_encoder_layers, None  # None = no attention weights returned
-    
+
 class SarcasmModel(nn.Module):
-    def __init__(self, params):
+    def __init__(self, args):
         super(SarcasmModel, self).__init__()
-        
-        # 1. Decouple the encoders
-        self.text_model = AutoModel.from_pretrained(params.text_model_name)
-        self.vision_model = CLIPVisionModel.from_pretrained(params.vision_model_name)
-        
-        # 2. Use IndoBERT's config for the fusion transformer (768 dimensions)
-        self.config = self.text_model.config
-        self.config.num_hidden_layers = params.layers
-        # self.config._attn_implementation = "eager"
-        
-        self.trans = MultimodalEncoder(self.config, layer_number=params.layers)
-        
-        if params.simple_linear:
-            self.text_linear = nn.Linear(params.text_size, params.text_size)
-            self.image_linear = nn.Linear(params.image_size, params.image_size)
+        self.args = args
+        self.fuse_dim = getattr(args, "fuse_dim", 768)
+
+        # 1. Multilingual Text Encoder (LaBSE + Linear Projection to shared space)
+        self.mclip = pt_multilingual_clip.MultilingualCLIP.from_pretrained(args.text_model_name)
+        self.text_encoder = self.mclip.transformer
+        self.text_projection = self.mclip.LinearTransformation
+
+        # 2. CLIP Vision Encoder (OpenAI ViT-L/14 with Projection to 768)
+        self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(args.vision_model_name)
+
+        # 3. Multimodal Cross-Attention Fusion
+        self.config = BertConfig.from_pretrained("bert-base-uncased")
+        self.config.hidden_size = self.fuse_dim
+        self.config.num_attention_heads = 8
+        self.trans = MultimodalEncoder(self.config, layer_number=args.layers)
+
+        # 4. Unimodal projection heads
+        if args.simple_linear:
+            self.text_linear = nn.Linear(self.fuse_dim, self.fuse_dim)
+            self.image_linear = nn.Linear(self.fuse_dim, self.fuse_dim)
         else:
             self.text_linear = nn.Sequential(
-                nn.Linear(params.text_size, params.text_size),
-                nn.Dropout(params.dropout_rate),
+                nn.Linear(self.fuse_dim, self.fuse_dim),
+                nn.Dropout(args.dropout_rate),
                 nn.GELU()
             )
             self.image_linear = nn.Sequential(
-                nn.Linear(params.image_size, params.image_size),
-                nn.Dropout(params.dropout_rate),
+                nn.Linear(self.fuse_dim, self.fuse_dim),
+                nn.Dropout(args.dropout_rate),
                 nn.GELU()
             )
 
-        self.classifier_fuse = nn.Linear(params.text_size, params.label_count)
-        self.classifier_text = nn.Linear(params.text_size, params.label_count)
-        self.classifier_image = nn.Linear(params.image_size, params.label_count)
+        # 5. Classifiers & loss
+        self.classifier_fuse = nn.Linear(self.fuse_dim, args.label_number)
+        self.classifier_text = nn.Linear(self.fuse_dim, args.label_number)
+        self.classifier_image = nn.Linear(self.fuse_dim, args.label_number)
 
         self.loss_fct = nn.CrossEntropyLoss()
-        self.att = nn.Linear(params.text_size, 1, bias=False)
+        self.att = nn.Linear(self.fuse_dim, 1, bias=False)
 
-    def forward(self, input_ids, attention_mask, pixel_values, labels=None):
-        # 1. Independent Text Encoding (IndoBERT)
-        text_outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
-        text_features = text_outputs.last_hidden_state  # [B, L_text, 768]
-        text_feature = text_outputs.pooler_output       # [B, 768]
+    def forward(self, input_ids=None, attention_mask=None, pixel_values=None, labels=None, **kwargs):
+        # Support dict input / kwargs
+        if isinstance(input_ids, dict):
+            kwargs = input_ids
+            input_ids = kwargs.get('input_ids')
+            attention_mask = kwargs.get('attention_mask')
+            pixel_values = kwargs.get('pixel_values')
+            if 'labels' in kwargs and labels is None:
+                labels = kwargs['labels']
 
-        # 2. Independent Image Encoding (CLIP Vision)
-        vision_outputs = self.vision_model(pixel_values=pixel_values)
-        image_features = vision_outputs.last_hidden_state # [B, L_image, 768]
-        image_feature = vision_outputs.pooler_output      # [B, 768]
+        # 1. Text Feature Extraction & Projection
+        text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        text_hidden_states = text_out.last_hidden_state  # [B, L_text, text_dim]
+        text_embeds = self.text_projection(text_hidden_states)  # [B, L_text, fuse_dim]
 
-        # Transform unimodal features for independent classification
-        text_feature = self.text_linear(text_feature)
-        image_feature = self.image_linear(image_feature)
+        # Mean-pooled text feature (attention masked)
+        text_att_expanded = attention_mask.unsqueeze(-1).to(text_embeds.dtype)
+        text_pooled = (text_embeds * text_att_expanded).sum(dim=1) / text_att_expanded.sum(dim=1).clamp(min=1e-9)
+        text_feature = self.text_linear(text_pooled)  # [B, fuse_dim]
 
-        # 3. Multimodal Fusion Preparation
-        # Directly concatenate the 768D sequences
-        input_embeds = torch.cat((image_features, text_features), dim=1)
-        
-        # Dynamic sequence length for images
-        vision_seq_len = image_features.shape[1]
-        vision_mask = torch.ones(text_features.shape[0], vision_seq_len, device=text_features.device)
-        concat_mask = torch.cat((vision_mask, attention_mask), dim=-1)
-        
-        extended_attention_mask = concat_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        # 2. Vision Feature Extraction & Projection
+        vision_out = self.vision_encoder(pixel_values=pixel_values, output_attentions=True)
+        image_hidden_states = vision_out.last_hidden_state  # [B, L_img, vision_dim]
+        image_embeds = self.vision_encoder.visual_projection(image_hidden_states)  # [B, L_img, fuse_dim]
+        image_feature = self.image_linear(vision_out.image_embeds)  # [B, fuse_dim]
 
-        # 4. Multimodal Fusion Pass
-        combined_seq_len = input_embeds.shape[1]
-        mask_seq_len = concat_mask.shape[-1]
-        
-        fuse_hiddens, all_attentions = self.trans(input_embeds, extended_attention_mask, output_all_encoded_layers=False)
-        fuse_hiddens = fuse_hiddens[-1]
-        
-        # Extract the fused text and image representations
-        new_text_features = fuse_hiddens[:, vision_seq_len:, :]
-        new_text_feature = new_text_features[
-            torch.arange(new_text_features.shape[0], device=input_ids.device), 
-            input_ids.to(torch.int).argmax(dim=-1)
-        ]
-        
-        # Extract image [CLS] token
-        new_image_feature = fuse_hiddens[:, 0, :]
+        # 3. Multimodal Token Concatenation & Cross-Attention
+        num_img_tokens = image_embeds.shape[1]
+        batch_size = input_ids.shape[0]
 
-        # 5. Attention-based Weighting
+        input_embeds = torch.cat((image_embeds, text_embeds), dim=1)  # [B, L_img + L_text, fuse_dim]
+
+        img_mask = torch.ones((batch_size, num_img_tokens), device=attention_mask.device, dtype=attention_mask.dtype)
+        combined_mask = torch.cat((img_mask, attention_mask), dim=-1)  # [B, L_img + L_text]
+
+        extended_mask = combined_mask.unsqueeze(1).unsqueeze(2)
+        extended_mask = extended_mask.to(dtype=next(self.parameters()).dtype)
+        extended_mask = (1.0 - extended_mask) * -10000.0
+
+        fuse_hiddens, all_attentions = self.trans(input_embeds, extended_mask, output_all_encoded_layers=False)
+        fuse_hiddens = fuse_hiddens[-1]  # [B, L_total, fuse_dim]
+
+        # 4. Multimodal Pooled Representations
+        new_image_feature = fuse_hiddens[:, 0, :]  # Visual CLS token [B, fuse_dim]
+        new_text_tokens = fuse_hiddens[:, num_img_tokens:, :]  # Fused text tokens [B, L_text, fuse_dim]
+        new_text_feature = (new_text_tokens * text_att_expanded).sum(dim=1) / text_att_expanded.sum(dim=1).clamp(min=1e-9)
+
+        # 5. Adaptive Attention Fusion
         text_weight = self.att(new_text_feature)
-        image_weight = self.att(new_image_feature)    
-        att = nn.functional.softmax(torch.stack((text_weight, image_weight), dim=-1), dim=-1)
-        tw, iw = att.split([1,1], dim=-1)
-        fuse_feature = tw.squeeze(1) * new_text_feature + iw.squeeze(1) * new_image_feature
+        image_weight = self.att(new_image_feature)
+        att = F.softmax(torch.cat((text_weight, image_weight), dim=-1), dim=-1)
+        tw = att[:, 0:1]
+        iw = att[:, 1:2]
+        fuse_feature = tw * new_text_feature + iw * new_image_feature
 
         # 6. Classification
         logits_fuse = self.classifier_fuse(fuse_feature)
         logits_text = self.classifier_text(text_feature)
         logits_image = self.classifier_image(image_feature)
-   
-        fuse_score = nn.functional.softmax(logits_fuse, dim=-1)
-        text_score = nn.functional.softmax(logits_text, dim=-1)
-        image_score = nn.functional.softmax(logits_image, dim=-1)
 
-        # Average the scores for a valid probability distribution
-        score = (fuse_score + text_score + image_score) / 3.0
+        fuse_score = F.softmax(logits_fuse, dim=-1)
+        text_score = F.softmax(logits_text, dim=-1)
+        image_score = F.softmax(logits_image, dim=-1)
+
+        score = fuse_score + text_score + image_score
 
         outputs = (score,)
         if labels is not None:
@@ -332,206 +348,197 @@ class SarcasmModel(nn.Module):
             loss_text = self.loss_fct(logits_text, labels)
             loss_image = self.loss_fct(logits_image, labels)
             loss = loss_fuse + loss_text + loss_image
-
             outputs = (loss,) + outputs
-            
+
         return outputs
 
-
 # %% [markdown]
-# # Train
+# # Evaluation & Metrics Helpers
 
 # %%
-from tqdm import tqdm, trange
+def evaluate_acc_f1(params, model, device, data, tokenizer, processor, macro=False, pre=None, mode='test'):
+    data_loader = DataLoader(
+        data,
+        batch_size=params.dev_batch_size,
+        collate_fn=MMSD2_id_dataset.collate_func,
+        shuffle=False
+    )
+    n_correct, n_total = 0, 0
+    t_targets_all, t_outputs_all = None, None
 
-# %%
-train_loader = DataLoader(dataset=train_dataset,
-                              batch_size=params.train_batch_size,
-                              collate_fn=MMSD2_id_dataset.collate_func,
-                              shuffle=True)
-
-model = SarcasmModel(params).to(device)
-
-# %%
-del model
-torch.cuda.empty_cache()
-
-# %%
-# clip_params = list(map(id, model.parameters()))
-# base_params = filter(lambda p: id(p) not in clip_params, model.parameters())
-# optimizer = ada([
-#         {"params": base_params},
-#         {"params": model.model.parameters(),"lr": args.clip_learning_rate}
-#         ], lr=args.learning_rate, weight_decay=args.weight_decay)
-# optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-# scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(args.warmup_proportion * total_steps),
-#                                         num_training_steps=total_steps)
-
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-processor = AutoProcessor.from_pretrained(params.vision_model_name)
-tokenizer = AutoTokenizer.from_pretrained(params.text_model_name)
-
-
-# %%
-# # 1. See what the model expects for dimensions
-# print(f"Expected size: {processor.image_processor.size}") 
-
-# # 2. See normalization values (Mean and Std)
-# print(f"Mean: {processor.image_processor.image_mean}")
-# print(f"Std: {processor.image_processor.image_std}")
-
-# # 3. Check the output shape with a dummy image (e.g., a random tensor)
-# import torch
-# dummy_image = torch.randn(3, 500, 500) # Simulating a 500x500 RGB image
-# # Rescale dummy_image to [0,1], convert to PIL, then process
-# img = dummy_image.clone().cpu()
-# img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-# np_img = (img.permute(1, 2, 0).mul(255).to(torch.uint8).numpy())
-# pil_img = Image.fromarray(np_img)
-# pixel_values = processor(images=pil_img, return_tensors="pt")["pixel_values"]
-
-# print(f"Processed image shape: {pixel_values.shape}")
-# # Likely [1, 3, 224, 224]
-
-# %%
-def evaluate_acc_f1(params, model, device, data, processor, macro=False,pre = None, mode='test'):
-        data_loader = DataLoader(data, batch_size=params.dev_batch_size, collate_fn=MMSD2_id_dataset.collate_func,shuffle=False)
-        n_correct, n_total = 0, 0
-        t_targets_all, t_outputs_all = None, None
-
-        model.eval()
-        sum_loss = 0.
-        sum_step = 0
-        with torch.no_grad():
-            for i_batch, t_batch in enumerate(data_loader):
-                text_list, image_list, label_list, id_list = t_batch
-                text_inputs = tokenizer(text_list, padding='max_length', truncation=True, max_length=params.max_len, return_tensors="pt").to(device)
-                image_inputs = processor(images=image_list, return_tensors="pt").to(device)
-                labels = torch.tensor(label_list).to(device)
-
-                input_ids = text_inputs['input_ids']
-                attention_mask = text_inputs['attention_mask']
-                pixel_values = image_inputs['pixel_values']
-                
-                t_targets = labels
-                loss, t_outputs = model(input_ids=input_ids, attention_mask=attention_mask, pixel_values=pixel_values, labels=labels)
-                sum_loss += loss.item()
-                sum_step += 1
-  
-                outputs = torch.argmax(t_outputs, -1)
-
-                n_correct += (outputs == t_targets).sum().item()
-                n_total += len(outputs)
-
-                if t_targets_all is None:
-                    t_targets_all = t_targets
-                    t_outputs_all = outputs
-                else:
-                    t_targets_all = torch.cat((t_targets_all, t_targets), dim=0)
-                    t_outputs_all = torch.cat((t_outputs_all, outputs), dim=0)
-        if mode == 'test':
-            # wandb.log({'test_loss': sum_loss/sum_step})
-            print(f"Test Loss: {sum_loss/sum_step}")
-        else:
-            # wandb.log({'dev_loss': sum_loss/sum_step})
-            print(f"Dev Loss: {sum_loss/sum_step}")
-        if pre != None:
-            with open(pre,'w',encoding='utf-8') as fout:
-                predict = t_outputs_all.cpu().numpy().tolist()
-                label = t_targets_all.cpu().numpy().tolist()
-                for x,y,z in zip(predict,label):
-                    fout.write(str(x) + str(y) +z+ '\n')
-        if not macro:   
-            acc = n_correct / n_total
-            f1 = metrics.f1_score(t_targets_all.cpu(), t_outputs_all.cpu())
-            precision =  metrics.precision_score(t_targets_all.cpu(),t_outputs_all.cpu())
-            recall = metrics.recall_score(t_targets_all.cpu(),t_outputs_all.cpu())
-        else:
-            acc = n_correct / n_total
-            f1 = metrics.f1_score(t_targets_all.cpu(), t_outputs_all.cpu(), labels=[0, 1],average='macro')
-            precision =  metrics.precision_score(t_targets_all.cpu(),t_outputs_all.cpu(), labels=[0, 1],average='macro')
-            recall = metrics.recall_score(t_targets_all.cpu(),t_outputs_all.cpu(), labels=[0, 1],average='macro')
-        return acc, f1 ,precision,recall
-
-
-# %%
-max_acc = 0.
-for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=False):
-    sum_loss = 0.
+    model.eval()
+    sum_loss = 0.0
     sum_step = 0
 
-    iter_bar = tqdm(train_loader, desc="Iter (loss=X.XXX)", disable=False)
+    with torch.no_grad():
+        for i_batch, t_batch in enumerate(data_loader):
+            text_list, image_list, label_list, id_list = t_batch
+            text_inputs = tokenizer(
+                text_list,
+                padding='max_length',
+                truncation=True,
+                max_length=params.max_len,
+                return_tensors="pt"
+            ).to(device)
+            image_inputs = processor(images=image_list, return_tensors="pt").to(device)
+            labels = torch.tensor(label_list, dtype=torch.long).to(device)
+
+            loss, t_outputs = model(
+                input_ids=text_inputs['input_ids'],
+                attention_mask=text_inputs['attention_mask'],
+                pixel_values=image_inputs['pixel_values'],
+                labels=labels
+            )
+            sum_loss += loss.item()
+            sum_step += 1
+
+            outputs = torch.argmax(t_outputs, -1)
+
+            n_correct += (outputs == labels).sum().item()
+            n_total += len(outputs)
+
+            if t_targets_all is None:
+                t_targets_all = labels
+                t_outputs_all = outputs
+            else:
+                t_targets_all = torch.cat((t_targets_all, labels), dim=0)
+                t_outputs_all = torch.cat((t_outputs_all, outputs), dim=0)
+
+    avg_loss = sum_loss / max(sum_step, 1)
+    if mode == 'test':
+        print(f"Test Loss: {avg_loss:.4f}")
+    else:
+        print(f"Dev Loss: {avg_loss:.4f}")
+
+    if pre is not None:
+        with open(pre, 'w', encoding='utf-8') as fout:
+            predict = t_outputs_all.cpu().numpy().tolist()
+            label = t_targets_all.cpu().numpy().tolist()
+            for pred_val, true_val in zip(predict, label):
+                fout.write(f"{pred_val}\t{true_val}\n")
+
+    acc = n_correct / max(n_total, 1)
+    avg_mode = 'macro' if macro else 'binary'
+    f1 = metrics.f1_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=avg_mode, zero_division=0)
+    precision = metrics.precision_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=avg_mode, zero_division=0)
+    recall = metrics.recall_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=avg_mode, zero_division=0)
+
+    return acc, f1, precision, recall
+
+# %% [markdown]
+# # Initialization & Training Setup
+
+# %%
+tokenizer = AutoTokenizer.from_pretrained(params.text_model_name)
+processor = AutoProcessor.from_pretrained(params.vision_model_name)
+
+train_loader = DataLoader(
+    dataset=train_dataset,
+    batch_size=params.train_batch_size,
+    collate_fn=MMSD2_id_dataset.collate_func,
+    shuffle=True
+)
+
+model = SarcasmModel(params).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
+
+# %% [markdown]
+# # Training Loop
+
+# %%
+max_acc = 0.0
+
+for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=False):
+    sum_loss = 0.0
+    sum_step = 0
+
+    iter_bar = tqdm(train_loader, desc=f"Epoch {i_epoch} Iter", disable=False)
     model.train()
 
     for step, batch in enumerate(iter_bar):
         text_list, image_list, label_list, id_list = batch
 
-        text_inputs = tokenizer(text_list, padding='max_length', truncation=True, max_length=params.max_len, return_tensors="pt").to(device)
+        text_inputs = tokenizer(
+            text_list,
+            padding='max_length',
+            truncation=True,
+            max_length=params.max_len,
+            return_tensors="pt"
+        ).to(device)
         image_inputs = processor(images=image_list, return_tensors="pt").to(device)
-        labels = torch.tensor(label_list).to(device)
+        labels = torch.tensor(label_list, dtype=torch.long).to(device)
 
-        input_ids = text_inputs['input_ids']
-        attention_mask = text_inputs['attention_mask']
-        pixel_values = image_inputs['pixel_values']
+        loss, score = model(
+            input_ids=text_inputs['input_ids'],
+            attention_mask=text_inputs['attention_mask'],
+            pixel_values=image_inputs['pixel_values'],
+            labels=labels
+        )
 
-        # Ensure text-related modules match the text encoder hidden size (fix 768 vs 512 mismatch)
-        text_hid = model.text_model.config.hidden_size
-        # determine current in_features of text_linear
-        if isinstance(model.text_linear, nn.Sequential):
-            cur_in = model.text_linear[0].in_features
-        else:
-            cur_in = model.text_linear.in_features
-        if cur_in != text_hid:
-            if params.simple_linear:
-                model.text_linear = nn.Linear(text_hid, text_hid).to(device)
-            else:
-                model.text_linear = nn.Sequential(
-                    nn.Linear(text_hid, text_hid),
-                    nn.Dropout(params.dropout_rate),
-                    nn.GELU()
-                ).to(device)
-                model.classifier_fuse = nn.Linear(text_hid, params.label_count).to(device)
-                model.classifier_text = nn.Linear(text_hid, params.label_count).to(device)
-                model.att = nn.Linear(text_hid, 1, bias=False).to(device)
-                # recreate optimizer so it includes newly created params
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-        loss, score = model(input_ids=input_ids, attention_mask=attention_mask, pixel_values=pixel_values, labels=labels)
         sum_loss += loss.item()
         sum_step += 1
 
-        iter_bar.set_description("Iter (loss=%5.3f)" % loss.item())
+        iter_bar.set_description(f"Epoch {i_epoch} Loss: {loss.item():.4f}")
         loss.backward()
         optimizer.step()
-        # if params.optimizer_name == 'adam':
-        #     scheduler.step() 
         optimizer.zero_grad()
 
-    print(f"Epoch {i_epoch} completed. Average Loss: {sum_loss/sum_step:.4f}")
-    # wandb.log({'train_loss': sum_loss/sum_step})
+    avg_train_loss = sum_loss / max(sum_step, 1)
+    print(f"\n--- Epoch {i_epoch} Summary ---")
+    print(f"Train Loss: {avg_train_loss:.4f}")
 
-    dev_acc, dev_f1 ,dev_precision,dev_recall = evaluate_acc_f1(params, model, device, val_dataset, processor, mode='dev')
-    print(f"Epoch {i_epoch} completed. Dev Acc: {dev_acc:.4f}, Dev F1: {dev_f1:.4f}, Dev Precision: {dev_precision:.4f}, Dev Recall: {dev_recall:.4f}")
-    # wandb.log({'dev_acc': dev_acc, 'dev_f1': dev_f1, 'dev_precision': dev_precision, 'dev_recall': dev_recall})
-    # logging.info("i_epoch is {}, dev_acc is {}, dev_f1 is {}, dev_precision is {}, dev_recall is {}".format(i_epoch, dev_acc, dev_f1, dev_precision, dev_recall))
+    dev_acc, dev_f1, dev_precision, dev_recall = evaluate_acc_f1(
+        params, model, device, val_dataset, tokenizer, processor, mode='dev'
+    )
+    print(f"Dev Acc: {dev_acc:.4f} | Dev F1: {dev_f1:.4f} | Dev Precision: {dev_precision:.4f} | Dev Recall: {dev_recall:.4f}")
 
+    # Checkpoint saving & testing on new best validation accuracy
     if dev_acc > max_acc:
         max_acc = dev_acc
-
         path_to_save = os.path.join(params.output_dir, params.model)
-        if not os.path.exists(path_to_save):
-            os.mkdir(path_to_save)
-        model_to_save = (model.module if hasattr(model, "module") else model)
+        os.makedirs(path_to_save, exist_ok=True)
+        model_to_save = model.module if hasattr(model, "module") else model
         torch.save(model_to_save.state_dict(), os.path.join(path_to_save, 'model.pt'))
+        print(f"[*] New best validation accuracy! Saved model checkpoint to {path_to_save}")
 
-        test_acc, test_f1,test_precision,test_recall = evaluate_acc_f1(params, model, device, test_dataset, processor,macro = True, mode='test')
-        _, test_f1_,test_precision_,test_recall_ = evaluate_acc_f1(params, model, device, test_dataset, processor, mode='test')
-        # wandb.log({'test_acc': test_acc, 'macro_test_f1': test_f1,
-        #             'macro_test_precision': test_precision,'macro_test_recall': test_recall, 'micro_test_f1': test_f1_,
-        #             'micro_test_precision': test_precision_,'micro_test_recall': test_recall_})
-        print(f"Epoch {i_epoch} completed. Test Acc: {test_acc:.4f}, Test F1: {test_f1:.4f}, Test Precision: {test_precision:.4f}, Test Recall: {test_recall:.4f}")
-        print(f"Epoch {i_epoch} completed. Micro Test F1: {test_f1_:.4f}, Micro Test Precision: {test_precision_:.4f}, Micro Test Recall: {test_recall_:.4f}")
+        test_acc, test_f1, test_precision, test_recall = evaluate_acc_f1(
+            params, model, device, test_dataset, tokenizer, processor, macro=True, mode='test'
+        )
+        _, test_f1_micro, test_precision_micro, test_recall_micro = evaluate_acc_f1(
+            params, model, device, test_dataset, tokenizer, processor, macro=False, mode='test'
+        )
+        print(f"Macro Test -> Acc: {test_acc:.4f} | F1: {test_f1:.4f} | Prec: {test_precision:.4f} | Rec: {test_recall:.4f}")
+        print(f"Micro Test -> F1: {test_f1_micro:.4f} | Prec: {test_precision_micro:.4f} | Rec: {test_recall_micro:.4f}")
 
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+# %% [markdown]
+# # Qualitative Inference & Attention Preview
+
+# %%
+import matplotlib.pyplot as plt
+
+def infer_sample(model, tokenizer, processor, text, image_path, device):
+    model.eval()
+    image = Image.open(image_path).convert("RGB")
+    image_inputs = processor(images=image, return_tensors="pt").to(device)
+    text_inputs = tokenizer(text, padding='max_length', truncation=True, max_length=params.max_len, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        score = model(
+            input_ids=text_inputs['input_ids'],
+            attention_mask=text_inputs['attention_mask'],
+            pixel_values=image_inputs['pixel_values']
+        )[0]
+        prob = score.softmax(dim=-1).cpu().numpy()[0]
+        pred_label = int(np.argmax(prob))
+
+    print(f"Text: '{text}'")
+    print(f"Prediction: {'Sarcastic' if pred_label == 1 else 'Not Sarcastic'} (Scores: {prob})")
+    plt.imshow(image)
+    plt.title(f"Prediction: {'Sarcastic' if pred_label == 1 else 'Not Sarcastic'}")
+    plt.axis("off")
+    plt.show()
 
 # %%
