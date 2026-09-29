@@ -6,7 +6,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.19.4
+#       jupytext_version: 1.19.5
 #   kernelspec:
 #     display_name: Python 3 (ipykernel)
 #     language: python
@@ -17,22 +17,33 @@
 # ## JALANIN INI CUMA KALO ENVIRONMENTNYA DISPOSABLE (Remote Jupyter Server)
 
 # %%
-import gdown
 import shutil
 import subprocess
 from pathlib import Path
 import os
+import random
+
+# Reduce allocator fragmentation for the large encoder activations and Adam
+# state tensors. This must be set before PyTorch initializes CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # %%
-subprocess.run(["pip", "install", "torch", "transformers", "gdown", "multilingual-clip", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo"])
+subprocess.run(["uv", "add", "torch", "torchvision", "transformers==4.49.0", "gdown", "multilingual-clip", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo", "matplotlib"], cwd="/root/bukan-skripsi/notebooks/3rd_exp")
 
 # %%
 # Optional: Install 7z if on Linux
 subprocess.run(["apt", "install", "-y", "p7zip-full"])
 
 # %%
-cwd = Path.cwd()
-project_root_dir = cwd.parents[1] if len(cwd.parents) >= 2 else cwd
+cwd = Path.cwd().resolve()
+
+# Jupyter normally starts in this notebook's directory, whereas the paired
+# Python file is often launched from the repository root. Find the repository
+# by its datasets directory instead of relying on a fixed number of parents.
+project_root_dir = next(
+    (path for path in (cwd, *cwd.parents) if (path / "datasets").is_dir()),
+    cwd,
+)
 dataset_root_dir = project_root_dir / "datasets"
 
 # Symlink or set dataset directory
@@ -56,13 +67,21 @@ if not dataset_dir.exists():
 # ### Download MMSD2.0 Images & Whitelist (if not already downloaded)
 
 # %%
-# Download MMSD2.0 image archives if dataset_image does not exist
-# if not (dataset_dir / "dataset_image").exists():
-gdown.download(url='https://drive.google.com/uc?id=1mK0Nf-jv_h2bgHUCRM4_EsdTiiitZ_Uj', output=str(dataset_dir) + "/", quiet=False)
-gdown.download(url='https://drive.google.com/uc?id=1AOWzlOz5hmdO39dEmzhQ4z_nabgzi7Tu', output=str(dataset_dir) + "/", quiet=False)
-gdown.download(url='https://drive.google.com/uc?id=1dJERrVlp7DlNSXk-uvbbG6Rv7uvqTOKd', output=str(dataset_dir) + "/", quiet=False)
-gdown.download(url='https://drive.google.com/uc?id=1pODuKC4gP6-QDQonG8XTqI8w8ds68mE3', output=str(dataset_dir) + "/", quiet=False)
-subprocess.run(["7z", "x", str(dataset_dir / "dataset_image.zip"), f"-o{dataset_dir}"])
+import gdown
+# Avoid downloading and extracting the large image archive on every rerun.
+# The metadata repository contains an empty dataset_image placeholder, so the
+# directory existing by itself does not mean the archive was extracted.
+image_dir = dataset_dir / "dataset_image"
+if not image_dir.is_dir() or not any(image_dir.glob("*.jpg")):
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    gdown.download(url='https://drive.google.com/uc?id=1mK0Nf-jv_h2bgHUCRM4_EsdTiiitZ_Uj', output=str(dataset_dir) + "/", quiet=False)
+    gdown.download(url='https://drive.google.com/uc?id=1AOWzlOz5hmdO39dEmzhQ4z_nabgzi7Tu', output=str(dataset_dir) + "/", quiet=False)
+    gdown.download(url='https://drive.google.com/uc?id=1dJERrVlp7DlNSXk-uvbbG6Rv7uvqTOKd', output=str(dataset_dir) + "/", quiet=False)
+    gdown.download(url='https://drive.google.com/uc?id=1pODuKC4gP6-QDQonG8XTqI8w8ds68mE3', output=str(dataset_dir) + "/", quiet=False)
+    subprocess.run(
+        ["7z", "x", str(dataset_dir / "dataset_image.zip"), f"-o{dataset_dir}"],
+        check=True,
+    )
 
 
 # %% [markdown]
@@ -75,7 +94,7 @@ class BlankObject:
 params = BlankObject()
 params.text_model_name = "M-CLIP/LABSE-Vit-L-14"
 params.vision_model_name = "openai/clip-vit-large-patch14"
-params.device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") or __import__("torch").cuda.is_available() else "cpu"
+params.device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
 params.simple_linear = False
 params.fuse_dim = 768        # M-CLIP project dim and ViT-L-14 visual projection dim
 params.text_size = 768
@@ -83,22 +102,23 @@ params.image_size = 768
 params.layers = 3
 params.dropout_rate = 0.1
 params.num_train_epochs = 10
-params.train_batch_size = 64
-params.dev_batch_size = 64
+params.train_batch_size = 8
+params.dev_batch_size = 8
 params.max_len = 77
 params.learning_rate = 1e-4
 params.label_count = 2
 params.label_number = 2
 params.output_dir = "./saved_models"
 params.model = "sarcasm_model_mclip_v1"
+params.seed = 42
 
 # %% [markdown]
 # # Dataset Loading & Preprocessing
 
 # %%
+import random
 import pandas as pd
 import numpy as np
-import random
 from PIL import Image
 from pathlib import Path
 import torch
@@ -106,23 +126,32 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer, AutoProcessor
 
+# Make data ordering and parameter initialization repeatable. Exact numerical
+# equality can still depend on the GPU, CUDA and PyTorch versions in use.
+random.seed(params.seed)
+np.random.seed(params.seed)
+torch.manual_seed(params.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(params.seed)
+
 # %%
 json_path = dataset_dir / "text_json_id" / "dataset_translated_fixed.json"
 df = pd.read_json(json_path, orient="records", dtype={"image_id": str, "label": int}).set_index("image_id")
 df.head()
 
 # %%
-# Filter out text-heavy images using whitelist
-whitelist_path = dataset_dir / "whitelist.txt"
-if whitelist_path.exists():
-    with open(whitelist_path, "r") as f:
-        whitelist = set(line.strip().replace(".jpg", "") for line in f if line.strip())
-    df = df[df.index.isin(whitelist)]
+# # Filter out text-heavy images using whitelist
+# # commented because for now i want to try training with all images, not just the whitelist
+# whitelist_path = dataset_dir / "whitelist.txt"
+# if whitelist_path.exists():
+#     with open(whitelist_path, "r") as f:
+#         whitelist = set(line.strip().replace(".jpg", "") for line in f if line.strip())
+#     df = df[df.index.isin(whitelist)]
 
-print(f"Total samples after whitelist filtering: {len(df)}")
-print(df.describe())
-print(df.info())
-print(df.value_counts(['split', 'label']))
+# print(f"Total samples after whitelist filtering: {len(df)}")
+# print(df.describe())
+# print(df.info())
+# print(df.value_counts(['split', 'label']))
 
 # %%
 class MMSD2_id_dataset(Dataset):
@@ -221,15 +250,17 @@ class MultimodalEncoder(nn.Module):
 
     def forward(self, hidden_states, attention_mask, output_all_encoded_layers=True):
         all_encoder_layers = []
-        all_encoder_attentions = []
         for layer_module in self.layer:
-            hidden_states, attention = layer_module(hidden_states, attention_mask, output_attentions=True)
-            all_encoder_attentions.append(attention)
+            hidden_states = layer_module(
+                hidden_states,
+                attention_mask,
+                output_attentions=False,
+            )[0]
             if output_all_encoded_layers:
                 all_encoder_layers.append(hidden_states)
         if not output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
-        return all_encoder_layers, all_encoder_attentions
+        return all_encoder_layers
 
 
 class SarcasmModel(nn.Module):
@@ -297,7 +328,7 @@ class SarcasmModel(nn.Module):
         text_feature = self.text_linear(text_pooled)  # [B, fuse_dim]
 
         # 2. Vision Feature Extraction & Projection
-        vision_out = self.vision_encoder(pixel_values=pixel_values, output_attentions=True)
+        vision_out = self.vision_encoder(pixel_values=pixel_values, output_attentions=False)
         image_hidden_states = vision_out.last_hidden_state  # [B, L_img, vision_dim]
         image_embeds = self.vision_encoder.visual_projection(image_hidden_states)  # [B, L_img, fuse_dim]
         image_feature = self.image_linear(vision_out.image_embeds)  # [B, fuse_dim]
@@ -315,7 +346,7 @@ class SarcasmModel(nn.Module):
         extended_mask = extended_mask.to(dtype=next(self.parameters()).dtype)
         extended_mask = (1.0 - extended_mask) * -10000.0
 
-        fuse_hiddens, all_attentions = self.trans(input_embeds, extended_mask, output_all_encoded_layers=False)
+        fuse_hiddens = self.trans(input_embeds, extended_mask, output_all_encoded_layers=False)
         fuse_hiddens = fuse_hiddens[-1]  # [B, L_total, fuse_dim]
 
         # 4. Multimodal Pooled Representations
@@ -340,7 +371,9 @@ class SarcasmModel(nn.Module):
         text_score = F.softmax(logits_text, dim=-1)
         image_score = F.softmax(logits_image, dim=-1)
 
-        score = fuse_score + text_score + image_score
+        # An equal-weight ensemble of the three heads. Averaging preserves the
+        # predicted class while returning a valid probability distribution.
+        score = (fuse_score + text_score + image_score) / 3.0
 
         outputs = (score,)
         if labels is not None:
@@ -356,7 +389,17 @@ class SarcasmModel(nn.Module):
 # # Evaluation & Metrics Helpers
 
 # %%
-def evaluate_acc_f1(params, model, device, data, tokenizer, processor, macro=False, pre=None, mode='test'):
+def evaluate_acc_f1(
+    params,
+    model,
+    device,
+    data,
+    tokenizer,
+    processor,
+    average='binary',
+    pre=None,
+    mode='test',
+):
     data_loader = DataLoader(
         data,
         batch_size=params.dev_batch_size,
@@ -418,10 +461,9 @@ def evaluate_acc_f1(params, model, device, data, tokenizer, processor, macro=Fal
                 fout.write(f"{pred_val}\t{true_val}\n")
 
     acc = n_correct / max(n_total, 1)
-    avg_mode = 'macro' if macro else 'binary'
-    f1 = metrics.f1_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=avg_mode, zero_division=0)
-    precision = metrics.precision_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=avg_mode, zero_division=0)
-    recall = metrics.recall_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=avg_mode, zero_division=0)
+    f1 = metrics.f1_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=average, zero_division=0)
+    precision = metrics.precision_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=average, zero_division=0)
+    recall = metrics.recall_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=average, zero_division=0)
 
     return acc, f1, precision, recall
 
@@ -436,17 +478,24 @@ train_loader = DataLoader(
     dataset=train_dataset,
     batch_size=params.train_batch_size,
     collate_fn=MMSD2_id_dataset.collate_func,
-    shuffle=True
+    shuffle=True,
+    generator=torch.Generator().manual_seed(params.seed),
 )
 
 model = SarcasmModel(params).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
+# Fused Adam avoids the large update temporaries created by the foreach and
+# single-tensor implementations for these two large encoders.
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=params.learning_rate,
+    fused=device.type == "cuda",
+)
 
 # %% [markdown]
 # # Training Loop
 
 # %%
-max_acc = 0.0
+max_acc = float('-inf')
 
 for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=False):
     sum_loss = 0.0
@@ -492,7 +541,7 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
     )
     print(f"Dev Acc: {dev_acc:.4f} | Dev F1: {dev_f1:.4f} | Dev Precision: {dev_precision:.4f} | Dev Recall: {dev_recall:.4f}")
 
-    # Checkpoint saving & testing on new best validation accuracy
+    # Select and save checkpoints using validation data only.
     if dev_acc > max_acc:
         max_acc = dev_acc
         path_to_save = os.path.join(params.output_dir, params.model)
@@ -501,17 +550,23 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
         torch.save(model_to_save.state_dict(), os.path.join(path_to_save, 'model.pt'))
         print(f"[*] New best validation accuracy! Saved model checkpoint to {path_to_save}")
 
-        test_acc, test_f1, test_precision, test_recall = evaluate_acc_f1(
-            params, model, device, test_dataset, tokenizer, processor, macro=True, mode='test'
-        )
-        _, test_f1_micro, test_precision_micro, test_recall_micro = evaluate_acc_f1(
-            params, model, device, test_dataset, tokenizer, processor, macro=False, mode='test'
-        )
-        print(f"Macro Test -> Acc: {test_acc:.4f} | F1: {test_f1:.4f} | Prec: {test_precision:.4f} | Rec: {test_recall:.4f}")
-        print(f"Micro Test -> F1: {test_f1_micro:.4f} | Prec: {test_precision_micro:.4f} | Rec: {test_recall_micro:.4f}")
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+# Evaluate the test set once, using the checkpoint selected on validation data.
+best_model_path = os.path.join(params.output_dir, params.model, 'model.pt')
+if os.path.exists(best_model_path):
+    model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
+    test_acc, test_f1, test_precision, test_recall = evaluate_acc_f1(
+        params, model, device, test_dataset, tokenizer, processor, average='macro', mode='test'
+    )
+    _, test_f1_micro, test_precision_micro, test_recall_micro = evaluate_acc_f1(
+        params, model, device, test_dataset, tokenizer, processor, average='micro', mode='test'
+    )
+    print(f"Macro Test -> Acc: {test_acc:.4f} | F1: {test_f1:.4f} | Prec: {test_precision:.4f} | Rec: {test_recall:.4f}")
+    print(f"Micro Test -> F1: {test_f1_micro:.4f} | Prec: {test_precision_micro:.4f} | Rec: {test_recall_micro:.4f}")
+else:
+    print("No best checkpoint was saved; skipping test evaluation.")
 
 # %% [markdown]
 # # Qualitative Inference & Attention Preview
@@ -531,7 +586,7 @@ def infer_sample(model, tokenizer, processor, text, image_path, device):
             attention_mask=text_inputs['attention_mask'],
             pixel_values=image_inputs['pixel_values']
         )[0]
-        prob = score.softmax(dim=-1).cpu().numpy()[0]
+        prob = score.cpu().numpy()[0]
         pred_label = int(np.argmax(prob))
 
     print(f"Text: '{text}'")
