@@ -8,9 +8,9 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.5
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: 3rd-exp
 #     language: python
-#     name: python3
+#     name: 3rd-exp
 # ---
 
 # %% [markdown]
@@ -467,7 +467,7 @@ def evaluate_acc_f1(
     precision = metrics.precision_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=average, zero_division=0)
     recall = metrics.recall_score(t_targets_all.cpu(), t_outputs_all.cpu(), average=average, zero_division=0)
 
-    return acc, f1, precision, recall
+    return avg_loss, acc, f1, precision, recall
 
 # %% [markdown]
 # # Initialization & Training Setup
@@ -534,6 +534,8 @@ save_metrics_history()
 for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=False):
     sum_loss = 0.0
     sum_step = 0
+    train_targets_all = []
+    train_outputs_all = []
 
     iter_bar = tqdm(train_loader, desc=f"Epoch {i_epoch} Iter", disable=False)
     model.train()
@@ -560,6 +562,8 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
 
         sum_loss += loss.item()
         sum_step += 1
+        train_targets_all.append(labels.detach().cpu())
+        train_outputs_all.append(torch.argmax(score.detach(), dim=-1).cpu())
 
         iter_bar.set_description(f"Epoch {i_epoch} Loss: {loss.item():.4f}")
         loss.backward()
@@ -567,13 +571,29 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
         optimizer.zero_grad()
 
     avg_train_loss = sum_loss / max(sum_step, 1)
+    train_targets_all = torch.cat(train_targets_all)
+    train_outputs_all = torch.cat(train_outputs_all)
+    train_acc = metrics.accuracy_score(train_targets_all, train_outputs_all)
+    train_f1 = metrics.f1_score(
+        train_targets_all, train_outputs_all, average='binary', zero_division=0
+    )
+    train_precision = metrics.precision_score(
+        train_targets_all, train_outputs_all, average='binary', zero_division=0
+    )
+    train_recall = metrics.recall_score(
+        train_targets_all, train_outputs_all, average='binary', zero_division=0
+    )
     print(f"\n--- Epoch {i_epoch} Summary ---")
-    print(f"Train Loss: {avg_train_loss:.4f}")
+    print(
+        f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+        f"Train F1: {train_f1:.4f} | Train Precision: {train_precision:.4f} | "
+        f"Train Recall: {train_recall:.4f}"
+    )
 
-    dev_acc, dev_f1, dev_precision, dev_recall = evaluate_acc_f1(
+    dev_loss, dev_acc, dev_f1, dev_precision, dev_recall = evaluate_acc_f1(
         params, model, device, val_dataset, tokenizer, processor, mode='dev'
     )
-    print(f"Dev Acc: {dev_acc:.4f} | Dev F1: {dev_f1:.4f} | Dev Precision: {dev_precision:.4f} | Dev Recall: {dev_recall:.4f}")
+    print(f"Dev Loss: {dev_loss:.4f} | Dev Acc: {dev_acc:.4f} | Dev F1: {dev_f1:.4f} | Dev Precision: {dev_precision:.4f} | Dev Recall: {dev_recall:.4f}")
 
     # Select and save checkpoints using validation data only.
     is_best = dev_acc > max_acc
@@ -586,6 +606,11 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
     metrics_history["epochs"].append({
         "epoch": i_epoch + 1,
         "train_loss": float(avg_train_loss),
+        "train_acc": float(train_acc),
+        "train_f1": float(train_f1),
+        "train_precision": float(train_precision),
+        "train_recall": float(train_recall),
+        "dev_loss": float(dev_loss),
         "dev_acc": float(dev_acc),
         "dev_f1": float(dev_f1),
         "dev_precision": float(dev_precision),
@@ -603,16 +628,17 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
 best_model_path = run_output_dir / 'model.pt'
 if best_model_path.exists():
     model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
-    test_acc, test_f1, test_precision, test_recall = evaluate_acc_f1(
+    test_loss, test_acc, test_f1, test_precision, test_recall = evaluate_acc_f1(
         params, model, device, test_dataset, tokenizer, processor, average='macro', mode='test'
     )
-    _, test_f1_micro, test_precision_micro, test_recall_micro = evaluate_acc_f1(
+    _, _, test_f1_micro, test_precision_micro, test_recall_micro = evaluate_acc_f1(
         params, model, device, test_dataset, tokenizer, processor, average='micro', mode='test'
     )
     print(f"Macro Test -> Acc: {test_acc:.4f} | F1: {test_f1:.4f} | Prec: {test_precision:.4f} | Rec: {test_recall:.4f}")
     print(f"Micro Test -> F1: {test_f1_micro:.4f} | Prec: {test_precision_micro:.4f} | Rec: {test_recall_micro:.4f}")
     metrics_history["test"] = {
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "loss": float(test_loss),
         "macro": {
             "accuracy": float(test_acc),
             "f1": float(test_f1),
@@ -651,16 +677,42 @@ def plot_metrics_history(history_path, show=True):
     epochs = [entry["epoch"] for entry in epochs_history]
     best_entries = [entry for entry in epochs_history if entry.get("is_best")]
 
-    figure, axes = plt.subplots(1, 3, figsize=(18, 5))
+    figure, axes = plt.subplots(2, 2, figsize=(14, 10))
+    loss_axis, train_axis, validation_axis, learning_rate_axis = axes.flat
 
-    axes[0].plot(
+    loss_axis.plot(
         epochs,
         [entry["train_loss"] for entry in epochs_history],
         marker="o",
-        color="tab:blue",
+        label="Train loss",
     )
-    axes[0].set_title("Training Loss")
-    axes[0].set_ylabel("Loss")
+    loss_axis.plot(
+        epochs,
+        [entry["dev_loss"] for entry in epochs_history],
+        marker="o",
+        label="Validation loss",
+    )
+    loss_axis.set_title("Loss")
+    loss_axis.set_ylabel("Loss")
+    loss_axis.legend()
+
+    training_metrics = {
+        "Accuracy": "train_acc",
+        "F1": "train_f1",
+        "Precision": "train_precision",
+        "Recall": "train_recall",
+    }
+    for label, key in training_metrics.items():
+        train_axis.plot(
+            epochs,
+            [entry[key] for entry in epochs_history],
+            marker="o",
+            label=label,
+        )
+    train_axis.set_title("Training Metrics")
+    train_axis.set_ylabel("Score")
+    train_axis.set_ylim(0.0, 1.0)
+    train_axis.legend()
 
     validation_metrics = {
         "Accuracy": "dev_acc",
@@ -669,14 +721,14 @@ def plot_metrics_history(history_path, show=True):
         "Recall": "dev_recall",
     }
     for label, key in validation_metrics.items():
-        axes[1].plot(
+        validation_axis.plot(
             epochs,
             [entry[key] for entry in epochs_history],
             marker="o",
             label=label,
         )
     if best_entries:
-        axes[1].scatter(
+        validation_axis.scatter(
             [entry["epoch"] for entry in best_entries],
             [entry["dev_acc"] for entry in best_entries],
             marker="*",
@@ -686,21 +738,21 @@ def plot_metrics_history(history_path, show=True):
             label="Saved checkpoint",
             zorder=3,
         )
-    axes[1].set_title("Validation Metrics")
-    axes[1].set_ylabel("Score")
-    axes[1].set_ylim(0.0, 1.0)
-    axes[1].legend()
+    validation_axis.set_title("Validation Metrics")
+    validation_axis.set_ylabel("Score")
+    validation_axis.set_ylim(0.0, 1.0)
+    validation_axis.legend()
 
-    axes[2].plot(
+    learning_rate_axis.plot(
         epochs,
         [entry["learning_rate"] for entry in epochs_history],
         marker="o",
         color="tab:purple",
     )
-    axes[2].set_title("Learning Rate")
-    axes[2].set_ylabel("Learning rate")
+    learning_rate_axis.set_title("Learning Rate")
+    learning_rate_axis.set_ylabel("Learning rate")
 
-    for axis in axes:
+    for axis in axes.flat:
         axis.set_xlabel("Epoch")
         axis.set_xticks(epochs)
         axis.grid(True, alpha=0.3)
