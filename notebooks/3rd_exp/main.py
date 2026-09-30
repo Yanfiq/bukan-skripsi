@@ -22,6 +22,8 @@ import subprocess
 from pathlib import Path
 import os
 import random
+import json
+from datetime import datetime, timezone
 
 # Reduce allocator fragmentation for the large encoder activations and Adam
 # state tensors. This must be set before PyTorch initializes CUDA.
@@ -496,6 +498,38 @@ optimizer = torch.optim.Adam(
 
 # %%
 max_acc = float('-inf')
+run_output_dir = Path(params.output_dir) / params.model
+run_output_dir.mkdir(parents=True, exist_ok=True)
+metrics_path = run_output_dir / "metrics_history.json"
+
+metrics_history = {
+    "schema_version": 1,
+    "model": params.model,
+    "started_at": datetime.now(timezone.utc).isoformat(),
+    "config": {
+        "text_model_name": params.text_model_name,
+        "vision_model_name": params.vision_model_name,
+        "num_train_epochs": int(params.num_train_epochs),
+        "train_batch_size": int(params.train_batch_size),
+        "dev_batch_size": int(params.dev_batch_size),
+        "learning_rate": float(params.learning_rate),
+        "seed": int(params.seed),
+    },
+    "epochs": [],
+    "test": None,
+}
+
+
+def save_metrics_history():
+    """Atomically persist metrics so an interrupted run keeps prior epochs."""
+    temporary_path = metrics_path.with_suffix(".json.tmp")
+    with temporary_path.open("w", encoding="utf-8") as metrics_file:
+        json.dump(metrics_history, metrics_file, indent=2, ensure_ascii=False)
+        metrics_file.write("\n")
+    temporary_path.replace(metrics_path)
+
+
+save_metrics_history()
 
 for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=False):
     sum_loss = 0.0
@@ -542,20 +576,32 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
     print(f"Dev Acc: {dev_acc:.4f} | Dev F1: {dev_f1:.4f} | Dev Precision: {dev_precision:.4f} | Dev Recall: {dev_recall:.4f}")
 
     # Select and save checkpoints using validation data only.
-    if dev_acc > max_acc:
+    is_best = dev_acc > max_acc
+    if is_best:
         max_acc = dev_acc
-        path_to_save = os.path.join(params.output_dir, params.model)
-        os.makedirs(path_to_save, exist_ok=True)
         model_to_save = model.module if hasattr(model, "module") else model
-        torch.save(model_to_save.state_dict(), os.path.join(path_to_save, 'model.pt'))
-        print(f"[*] New best validation accuracy! Saved model checkpoint to {path_to_save}")
+        torch.save(model_to_save.state_dict(), run_output_dir / 'model.pt')
+        print(f"[*] New best validation accuracy! Saved model checkpoint to {run_output_dir}")
+
+    metrics_history["epochs"].append({
+        "epoch": i_epoch + 1,
+        "train_loss": float(avg_train_loss),
+        "dev_acc": float(dev_acc),
+        "dev_f1": float(dev_f1),
+        "dev_precision": float(dev_precision),
+        "dev_recall": float(dev_recall),
+        "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "is_best": bool(is_best),
+    })
+    save_metrics_history()
+    print(f"Metrics saved to {metrics_path}")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 # Evaluate the test set once, using the checkpoint selected on validation data.
-best_model_path = os.path.join(params.output_dir, params.model, 'model.pt')
-if os.path.exists(best_model_path):
+best_model_path = run_output_dir / 'model.pt'
+if best_model_path.exists():
     model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
     test_acc, test_f1, test_precision, test_recall = evaluate_acc_f1(
         params, model, device, test_dataset, tokenizer, processor, average='macro', mode='test'
@@ -565,35 +611,112 @@ if os.path.exists(best_model_path):
     )
     print(f"Macro Test -> Acc: {test_acc:.4f} | F1: {test_f1:.4f} | Prec: {test_precision:.4f} | Rec: {test_recall:.4f}")
     print(f"Micro Test -> F1: {test_f1_micro:.4f} | Prec: {test_precision_micro:.4f} | Rec: {test_recall_micro:.4f}")
+    metrics_history["test"] = {
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "macro": {
+            "accuracy": float(test_acc),
+            "f1": float(test_f1),
+            "precision": float(test_precision),
+            "recall": float(test_recall),
+        },
+        "micro": {
+            "f1": float(test_f1_micro),
+            "precision": float(test_precision_micro),
+            "recall": float(test_recall_micro),
+        },
+    }
+    metrics_history["completed_at"] = datetime.now(timezone.utc).isoformat()
+    save_metrics_history()
 else:
     print("No best checkpoint was saved; skipping test evaluation.")
 
 # %% [markdown]
-# # Qualitative Inference & Attention Preview
+# # Evaluation
 
 # %%
 import matplotlib.pyplot as plt
 
-def infer_sample(model, tokenizer, processor, text, image_path, device):
-    model.eval()
-    image = Image.open(image_path).convert("RGB")
-    image_inputs = processor(images=image, return_tensors="pt").to(device)
-    text_inputs = tokenizer(text, padding='max_length', truncation=True, max_length=params.max_len, return_tensors="pt").to(device)
 
-    with torch.no_grad():
-        score = model(
-            input_ids=text_inputs['input_ids'],
-            attention_mask=text_inputs['attention_mask'],
-            pixel_values=image_inputs['pixel_values']
-        )[0]
-        prob = score.cpu().numpy()[0]
-        pred_label = int(np.argmax(prob))
+def plot_metrics_history(history_path, show=True):
+    """Plot per-epoch metrics from JSON and save the graph beside it."""
+    history_path = Path(history_path)
+    with history_path.open("r", encoding="utf-8") as metrics_file:
+        history = json.load(metrics_file)
 
-    print(f"Text: '{text}'")
-    print(f"Prediction: {'Sarcastic' if pred_label == 1 else 'Not Sarcastic'} (Scores: {prob})")
-    plt.imshow(image)
-    plt.title(f"Prediction: {'Sarcastic' if pred_label == 1 else 'Not Sarcastic'}")
-    plt.axis("off")
-    plt.show()
+    epochs_history = history.get("epochs", [])
+    if not epochs_history:
+        print(f"No epoch metrics found in {history_path}")
+        return None
 
-# %%
+    epochs = [entry["epoch"] for entry in epochs_history]
+    best_entries = [entry for entry in epochs_history if entry.get("is_best")]
+
+    figure, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    axes[0].plot(
+        epochs,
+        [entry["train_loss"] for entry in epochs_history],
+        marker="o",
+        color="tab:blue",
+    )
+    axes[0].set_title("Training Loss")
+    axes[0].set_ylabel("Loss")
+
+    validation_metrics = {
+        "Accuracy": "dev_acc",
+        "F1": "dev_f1",
+        "Precision": "dev_precision",
+        "Recall": "dev_recall",
+    }
+    for label, key in validation_metrics.items():
+        axes[1].plot(
+            epochs,
+            [entry[key] for entry in epochs_history],
+            marker="o",
+            label=label,
+        )
+    if best_entries:
+        axes[1].scatter(
+            [entry["epoch"] for entry in best_entries],
+            [entry["dev_acc"] for entry in best_entries],
+            marker="*",
+            s=180,
+            color="gold",
+            edgecolor="black",
+            label="Saved checkpoint",
+            zorder=3,
+        )
+    axes[1].set_title("Validation Metrics")
+    axes[1].set_ylabel("Score")
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].legend()
+
+    axes[2].plot(
+        epochs,
+        [entry["learning_rate"] for entry in epochs_history],
+        marker="o",
+        color="tab:purple",
+    )
+    axes[2].set_title("Learning Rate")
+    axes[2].set_ylabel("Learning rate")
+
+    for axis in axes:
+        axis.set_xlabel("Epoch")
+        axis.set_xticks(epochs)
+        axis.grid(True, alpha=0.3)
+
+    figure.suptitle(history.get("model", "Training History"))
+    figure.tight_layout()
+
+    figure_path = history_path.with_name("metrics_history.png")
+    figure.savefig(figure_path, dpi=160, bbox_inches="tight")
+    print(f"Training history plot saved to {figure_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return figure
+
+
+plot_metrics_history(metrics_path)
