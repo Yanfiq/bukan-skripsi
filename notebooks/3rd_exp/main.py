@@ -22,15 +22,13 @@ import subprocess
 from pathlib import Path
 import os
 import random
-import json
-from datetime import datetime, timezone
 
 # Reduce allocator fragmentation for the large encoder activations and Adam
 # state tensors. This must be set before PyTorch initializes CUDA.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # %%
-subprocess.run(["uv", "add", "torch", "torchvision", "transformers==4.49.0", "gdown", "multilingual-clip", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo", "matplotlib"], cwd="/root/bukan-skripsi/notebooks/3rd_exp")
+subprocess.run(["uv", "add", "torch", "torchvision", "transformers==4.49.0", "gdown", "multilingual-clip", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo", "wandb"], cwd="/root/bukan-skripsi/notebooks/3rd_exp")
 
 # %%
 # Optional: Install 7z if on Linux
@@ -113,6 +111,7 @@ params.label_number = 2
 params.output_dir = "./saved_models"
 params.model = "sarcasm_model_mclip_v1"
 params.seed = 42
+params.wandb_project = "mmsd2-sarcasm"
 
 # %% [markdown]
 # # Dataset Loading & Preprocessing
@@ -127,6 +126,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer, AutoProcessor
+import wandb
 
 # Make data ordering and parameter initialization repeatable. Exact numerical
 # equality can still depend on the GPU, CUDA and PyTorch versions in use.
@@ -500,36 +500,29 @@ optimizer = torch.optim.Adam(
 max_acc = float('-inf')
 run_output_dir = Path(params.output_dir) / params.model
 run_output_dir.mkdir(parents=True, exist_ok=True)
-metrics_path = run_output_dir / "metrics_history.json"
-
-metrics_history = {
-    "schema_version": 1,
-    "model": params.model,
-    "started_at": datetime.now(timezone.utc).isoformat(),
-    "config": {
+wandb.login()
+wandb_run = wandb.init(
+    project=params.wandb_project,
+    name=params.model,
+    job_type="train",
+    save_code=True,
+    config={
         "text_model_name": params.text_model_name,
         "vision_model_name": params.vision_model_name,
         "num_train_epochs": int(params.num_train_epochs),
         "train_batch_size": int(params.train_batch_size),
         "dev_batch_size": int(params.dev_batch_size),
+        "max_len": int(params.max_len),
         "learning_rate": float(params.learning_rate),
+        "fusion_layers": int(params.layers),
+        "dropout_rate": float(params.dropout_rate),
         "seed": int(params.seed),
     },
-    "epochs": [],
-    "test": None,
-}
-
-
-def save_metrics_history():
-    """Atomically persist metrics so an interrupted run keeps prior epochs."""
-    temporary_path = metrics_path.with_suffix(".json.tmp")
-    with temporary_path.open("w", encoding="utf-8") as metrics_file:
-        json.dump(metrics_history, metrics_file, indent=2, ensure_ascii=False)
-        metrics_file.write("\n")
-    temporary_path.replace(metrics_path)
-
-
-save_metrics_history()
+)
+wandb.define_metric("epoch")
+wandb.define_metric("train/*", step_metric="epoch")
+wandb.define_metric("validation/*", step_metric="epoch")
+wandb.define_metric("optimization/*", step_metric="epoch")
 
 for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=False):
     sum_loss = 0.0
@@ -603,23 +596,21 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
         torch.save(model_to_save.state_dict(), run_output_dir / 'model.pt')
         print(f"[*] New best validation accuracy! Saved model checkpoint to {run_output_dir}")
 
-    metrics_history["epochs"].append({
+    wandb_run.log({
         "epoch": i_epoch + 1,
-        "train_loss": float(avg_train_loss),
-        "train_acc": float(train_acc),
-        "train_f1": float(train_f1),
-        "train_precision": float(train_precision),
-        "train_recall": float(train_recall),
-        "dev_loss": float(dev_loss),
-        "dev_acc": float(dev_acc),
-        "dev_f1": float(dev_f1),
-        "dev_precision": float(dev_precision),
-        "dev_recall": float(dev_recall),
-        "learning_rate": float(optimizer.param_groups[0]["lr"]),
-        "is_best": bool(is_best),
+        "train/loss": float(avg_train_loss),
+        "train/accuracy": float(train_acc),
+        "train/f1": float(train_f1),
+        "train/precision": float(train_precision),
+        "train/recall": float(train_recall),
+        "validation/loss": float(dev_loss),
+        "validation/accuracy": float(dev_acc),
+        "validation/f1": float(dev_f1),
+        "validation/precision": float(dev_precision),
+        "validation/recall": float(dev_recall),
+        "optimization/learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "checkpoint/is_best": int(is_best),
     })
-    save_metrics_history()
-    print(f"Metrics saved to {metrics_path}")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -636,139 +627,34 @@ if best_model_path.exists():
     )
     print(f"Macro Test -> Acc: {test_acc:.4f} | F1: {test_f1:.4f} | Prec: {test_precision:.4f} | Rec: {test_recall:.4f}")
     print(f"Micro Test -> F1: {test_f1_micro:.4f} | Prec: {test_precision_micro:.4f} | Rec: {test_recall_micro:.4f}")
-    metrics_history["test"] = {
-        "evaluated_at": datetime.now(timezone.utc).isoformat(),
-        "loss": float(test_loss),
-        "macro": {
-            "accuracy": float(test_acc),
-            "f1": float(test_f1),
-            "precision": float(test_precision),
-            "recall": float(test_recall),
+    wandb_run.log({
+        "test/loss": float(test_loss),
+        "test/accuracy": float(test_acc),
+        "test/macro_f1": float(test_f1),
+        "test/macro_precision": float(test_precision),
+        "test/macro_recall": float(test_recall),
+        "test/micro_f1": float(test_f1_micro),
+        "test/micro_precision": float(test_precision_micro),
+        "test/micro_recall": float(test_recall_micro),
+    })
+    wandb_run.summary["best_validation_accuracy"] = float(max_acc)
+    wandb_run.summary["test_accuracy"] = float(test_acc)
+    wandb_run.summary["test_macro_f1"] = float(test_f1)
+    wandb_run.summary["test_micro_f1"] = float(test_f1_micro)
+
+    model_artifact = wandb.Artifact(
+        name=f"{params.model}-best",
+        type="model",
+        description="Best checkpoint selected by validation accuracy",
+        metadata={
+            "best_validation_accuracy": float(max_acc),
+            "text_model_name": params.text_model_name,
+            "vision_model_name": params.vision_model_name,
         },
-        "micro": {
-            "f1": float(test_f1_micro),
-            "precision": float(test_precision_micro),
-            "recall": float(test_recall_micro),
-        },
-    }
-    metrics_history["completed_at"] = datetime.now(timezone.utc).isoformat()
-    save_metrics_history()
+    )
+    model_artifact.add_file(str(best_model_path), name="model.pt")
+    wandb_run.log_artifact(model_artifact, aliases=["best"])
 else:
     print("No best checkpoint was saved; skipping test evaluation.")
 
-# %% [markdown]
-# # Evaluation
-
-# %%
-import matplotlib.pyplot as plt
-
-
-def plot_metrics_history(history_path, show=True):
-    """Plot per-epoch metrics from JSON and save the graph beside it."""
-    history_path = Path(history_path)
-    with history_path.open("r", encoding="utf-8") as metrics_file:
-        history = json.load(metrics_file)
-
-    epochs_history = history.get("epochs", [])
-    if not epochs_history:
-        print(f"No epoch metrics found in {history_path}")
-        return None
-
-    epochs = [entry["epoch"] for entry in epochs_history]
-    best_entries = [entry for entry in epochs_history if entry.get("is_best")]
-
-    figure, axes = plt.subplots(2, 2, figsize=(14, 10))
-    loss_axis, train_axis, validation_axis, learning_rate_axis = axes.flat
-
-    loss_axis.plot(
-        epochs,
-        [entry["train_loss"] for entry in epochs_history],
-        marker="o",
-        label="Train loss",
-    )
-    loss_axis.plot(
-        epochs,
-        [entry["dev_loss"] for entry in epochs_history],
-        marker="o",
-        label="Validation loss",
-    )
-    loss_axis.set_title("Loss")
-    loss_axis.set_ylabel("Loss")
-    loss_axis.legend()
-
-    training_metrics = {
-        "Accuracy": "train_acc",
-        "F1": "train_f1",
-        "Precision": "train_precision",
-        "Recall": "train_recall",
-    }
-    for label, key in training_metrics.items():
-        train_axis.plot(
-            epochs,
-            [entry[key] for entry in epochs_history],
-            marker="o",
-            label=label,
-        )
-    train_axis.set_title("Training Metrics")
-    train_axis.set_ylabel("Score")
-    train_axis.set_ylim(0.0, 1.0)
-    train_axis.legend()
-
-    validation_metrics = {
-        "Accuracy": "dev_acc",
-        "F1": "dev_f1",
-        "Precision": "dev_precision",
-        "Recall": "dev_recall",
-    }
-    for label, key in validation_metrics.items():
-        validation_axis.plot(
-            epochs,
-            [entry[key] for entry in epochs_history],
-            marker="o",
-            label=label,
-        )
-    if best_entries:
-        validation_axis.scatter(
-            [entry["epoch"] for entry in best_entries],
-            [entry["dev_acc"] for entry in best_entries],
-            marker="*",
-            s=180,
-            color="gold",
-            edgecolor="black",
-            label="Saved checkpoint",
-            zorder=3,
-        )
-    validation_axis.set_title("Validation Metrics")
-    validation_axis.set_ylabel("Score")
-    validation_axis.set_ylim(0.0, 1.0)
-    validation_axis.legend()
-
-    learning_rate_axis.plot(
-        epochs,
-        [entry["learning_rate"] for entry in epochs_history],
-        marker="o",
-        color="tab:purple",
-    )
-    learning_rate_axis.set_title("Learning Rate")
-    learning_rate_axis.set_ylabel("Learning rate")
-
-    for axis in axes.flat:
-        axis.set_xlabel("Epoch")
-        axis.set_xticks(epochs)
-        axis.grid(True, alpha=0.3)
-
-    figure.suptitle(history.get("model", "Training History"))
-    figure.tight_layout()
-
-    figure_path = history_path.with_name("metrics_history.png")
-    figure.savefig(figure_path, dpi=160, bbox_inches="tight")
-    print(f"Training history plot saved to {figure_path}")
-
-    if show:
-        plt.show()
-    else:
-        plt.close(figure)
-    return figure
-
-
-plot_metrics_history(metrics_path)
+wandb_run.finish()
