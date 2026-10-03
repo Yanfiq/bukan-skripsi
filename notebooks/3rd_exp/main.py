@@ -102,10 +102,12 @@ params.image_size = 768
 params.layers = 3
 params.dropout_rate = 0.1
 params.num_train_epochs = 10
+params.freeze_encoder_epochs = 2
 params.train_batch_size = 8
 params.dev_batch_size = 8
 params.max_len = 77
-params.learning_rate = 1e-4
+params.encoder_learning_rate = 1e-5
+params.task_learning_rate = 1e-4
 params.label_count = 2
 params.label_number = 2
 params.output_dir = "./saved_models"
@@ -308,6 +310,31 @@ class SarcasmModel(nn.Module):
 
         self.loss_fct = nn.CrossEntropyLoss()
         self.att = nn.Linear(self.fuse_dim, 1, bias=False)
+        self.encoders_frozen = False
+
+    def set_encoders_trainable(self, trainable):
+        """Freeze or unfreeze both pretrained encoders and their projections."""
+        encoder_modules = (
+            self.text_encoder,
+            self.text_projection,
+            self.vision_encoder,
+        )
+        for module in encoder_modules:
+            for parameter in module.parameters():
+                parameter.requires_grad = trainable
+
+        self.encoders_frozen = not trainable
+        for module in encoder_modules:
+            module.train(self.training if trainable else False)
+
+    def train(self, mode=True):
+        """Keep frozen encoders deterministic while training the new layers."""
+        super().train(mode)
+        if mode and self.encoders_frozen:
+            self.text_encoder.eval()
+            self.text_projection.eval()
+            self.vision_encoder.eval()
+        return self
 
     def forward(self, input_ids=None, attention_mask=None, pixel_values=None, labels=None, **kwargs):
         # Support dict input / kwargs
@@ -485,12 +512,40 @@ train_loader = DataLoader(
 )
 
 model = SarcasmModel(params).to(device)
+if params.freeze_encoder_epochs > 0:
+    model.set_encoders_trainable(False)
+    print(f"Pretrained encoders frozen for the first {params.freeze_encoder_epochs} epochs")
+
+encoder_parameters = list(model.text_encoder.parameters())
+encoder_parameters += list(model.text_projection.parameters())
+encoder_parameters += list(model.vision_encoder.parameters())
+encoder_parameter_ids = {id(parameter) for parameter in encoder_parameters}
+task_parameters = [
+    parameter
+    for parameter in model.parameters()
+    if id(parameter) not in encoder_parameter_ids
+]
+
 # Fused Adam avoids the large update temporaries created by the foreach and
 # single-tensor implementations for these two large encoders.
 optimizer = torch.optim.Adam(
-    model.parameters(),
-    lr=params.learning_rate,
+    [
+        {
+            "params": encoder_parameters,
+            "lr": params.encoder_learning_rate,
+            "group_name": "pretrained_encoders",
+        },
+        {
+            "params": task_parameters,
+            "lr": params.task_learning_rate,
+            "group_name": "fusion_and_classifiers",
+        },
+    ],
     fused=device.type == "cuda",
+)
+print(
+    f"Learning rates -> encoders: {params.encoder_learning_rate:.2e}, "
+    f"fusion/classifiers: {params.task_learning_rate:.2e}"
 )
 
 # %% [markdown]
@@ -510,10 +565,12 @@ wandb_run = wandb.init(
         "text_model_name": params.text_model_name,
         "vision_model_name": params.vision_model_name,
         "num_train_epochs": int(params.num_train_epochs),
+        "freeze_encoder_epochs": int(params.freeze_encoder_epochs),
         "train_batch_size": int(params.train_batch_size),
         "dev_batch_size": int(params.dev_batch_size),
         "max_len": int(params.max_len),
-        "learning_rate": float(params.learning_rate),
+        "encoder_learning_rate": float(params.encoder_learning_rate),
+        "task_learning_rate": float(params.task_learning_rate),
         "fusion_layers": int(params.layers),
         "dropout_rate": float(params.dropout_rate),
         "seed": int(params.seed),
@@ -525,6 +582,12 @@ wandb.define_metric("validation/*", step_metric="epoch")
 wandb.define_metric("optimization/*", step_metric="epoch")
 
 for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=False):
+    encoders_should_train = i_epoch >= params.freeze_encoder_epochs
+    if encoders_should_train == model.encoders_frozen:
+        model.set_encoders_trainable(encoders_should_train)
+        encoder_state = "unfrozen" if encoders_should_train else "frozen"
+        print(f"Pretrained encoders are now {encoder_state} at epoch {i_epoch + 1}")
+
     sum_loss = 0.0
     sum_step = 0
     train_targets_all = []
@@ -608,7 +671,9 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
         "validation/f1": float(dev_f1),
         "validation/precision": float(dev_precision),
         "validation/recall": float(dev_recall),
-        "optimization/learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "optimization/encoder_learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "optimization/task_learning_rate": float(optimizer.param_groups[1]["lr"]),
+        "optimization/encoders_frozen": int(model.encoders_frozen),
         "checkpoint/is_best": int(is_best),
     })
 
