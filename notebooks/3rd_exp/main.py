@@ -8,9 +8,9 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.5
 #   kernelspec:
-#     display_name: 3rd-exp
+#     display_name: Python3 (ipykernel)
 #     language: python
-#     name: 3rd-exp
+#     name: python3
 # ---
 
 # %% [markdown]
@@ -22,13 +22,14 @@ import subprocess
 from pathlib import Path
 import os
 import random
+import time
 
 # Reduce allocator fragmentation for the large encoder activations and Adam
 # state tensors. This must be set before PyTorch initializes CUDA.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # %%
-subprocess.run(["uv", "add", "torch", "torchvision", "transformers==4.49.0", "gdown", "multilingual-clip", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo", "wandb"], cwd="/root/bukan-skripsi/notebooks/3rd_exp")
+subprocess.run(["uv", "add", "nbformat", "gdown", "torch", "torchvision", "transformers==4.49.0", "gdown", "multilingual-clip", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo", "wandb"])
 
 # %%
 # Optional: Install 7z if on Linux
@@ -103,6 +104,9 @@ params.layers = 3
 params.dropout_rate = 0.1
 params.num_train_epochs = 10
 params.freeze_encoder_epochs = 2
+params.vram_reservation_target_gib = 14.0
+params.vram_safety_margin_gib = 0.5
+params.vram_poll_interval_seconds = 60
 params.train_batch_size = 8
 params.dev_batch_size = 8
 params.max_len = 77
@@ -111,9 +115,9 @@ params.task_learning_rate = 1e-4
 params.label_count = 2
 params.label_number = 2
 params.output_dir = "./saved_models"
-params.model = "sarcasm_model_mclip_v1"
+params.model = "mclip_v1_en_baseline"
 params.seed = 42
-params.wandb_project = "mmsd2-sarcasm"
+params.wandb_project = "skripsi_3rd-exp"
 
 # %% [markdown]
 # # Dataset Loading & Preprocessing
@@ -171,7 +175,7 @@ class MMSD2_id_dataset(Dataset):
         return Image.open(img_path).convert("RGB")
 
     def text_loader(self, img_id):
-        return self.data[img_id]["text_translated"]
+        return self.data[img_id]["text"]
 
     def __getitem__(self, index):
         img_id = self.image_ids[index]
@@ -548,6 +552,75 @@ print(
     f"fusion/classifiers: {params.task_learning_rate:.2e}"
 )
 
+
+def wait_and_reserve_vram(
+    device,
+    target_reserved_gib,
+    safety_margin_gib,
+    poll_interval_seconds,
+):
+    """Wait until this process can reserve the expected unfrozen peak VRAM."""
+    if device.type != "cuda":
+        return
+
+    gib = 1024**3
+    target_bytes = int(target_reserved_gib * gib)
+    margin_bytes = int(safety_margin_gib * gib)
+    chunk_bytes = 256 * 1024**2
+
+    while True:
+        torch.cuda.synchronize(device)
+        currently_reserved = torch.cuda.memory_reserved(device)
+        additional_needed = max(target_bytes - currently_reserved, 0)
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+
+        print(
+            f"GPU memory: {free_bytes / gib:.2f} GiB free, "
+            f"{currently_reserved / gib:.2f} GiB reserved by this process, "
+            f"{additional_needed / gib:.2f} GiB more required"
+        )
+
+        if additional_needed == 0:
+            print("Required VRAM is already reserved.")
+            return
+
+        if free_bytes >= additional_needed + margin_bytes:
+            reservation_chunks = []
+            try:
+                remaining = additional_needed
+                while remaining > 0:
+                    allocation_size = min(remaining, chunk_bytes)
+                    reservation_chunks.append(
+                        torch.empty(
+                            allocation_size,
+                            dtype=torch.uint8,
+                            device=device,
+                        )
+                    )
+                    remaining -= allocation_size
+
+                torch.cuda.synchronize(device)
+                print(
+                    f"Successfully reserved "
+                    f"{torch.cuda.memory_reserved(device) / gib:.2f} GiB"
+                )
+
+                # Release the tensors but keep their blocks in this process's
+                # CUDA cache so the unfrozen training step can reuse them.
+                del reservation_chunks
+                torch.cuda.synchronize(device)
+                return
+            except torch.OutOfMemoryError:
+                print(
+                    "VRAM became unavailable during reservation; "
+                    "waiting before retrying."
+                )
+                del reservation_chunks
+                torch.cuda.empty_cache()
+
+        print(f"Retrying in {poll_interval_seconds} seconds...")
+        time.sleep(poll_interval_seconds)
+
 # %% [markdown]
 # # Training Loop
 
@@ -566,6 +639,9 @@ wandb_run = wandb.init(
         "vision_model_name": params.vision_model_name,
         "num_train_epochs": int(params.num_train_epochs),
         "freeze_encoder_epochs": int(params.freeze_encoder_epochs),
+        "vram_reservation_target_gib": float(params.vram_reservation_target_gib),
+        "vram_safety_margin_gib": float(params.vram_safety_margin_gib),
+        "vram_poll_interval_seconds": int(params.vram_poll_interval_seconds),
         "train_batch_size": int(params.train_batch_size),
         "dev_batch_size": int(params.dev_batch_size),
         "max_len": int(params.max_len),
@@ -584,6 +660,14 @@ wandb.define_metric("optimization/*", step_metric="epoch")
 for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=False):
     encoders_should_train = i_epoch >= params.freeze_encoder_epochs
     if encoders_should_train == model.encoders_frozen:
+        if encoders_should_train:
+            print("Waiting for enough VRAM before unfreezing encoders...")
+            wait_and_reserve_vram(
+                device=device,
+                target_reserved_gib=params.vram_reservation_target_gib,
+                safety_margin_gib=params.vram_safety_margin_gib,
+                poll_interval_seconds=params.vram_poll_interval_seconds,
+            )
         model.set_encoders_trainable(encoders_should_train)
         encoder_state = "unfrozen" if encoders_should_train else "frozen"
         print(f"Pretrained encoders are now {encoder_state} at epoch {i_epoch + 1}")
@@ -723,3 +807,5 @@ else:
     print("No best checkpoint was saved; skipping test evaluation.")
 
 wandb_run.finish()
+
+# %%
