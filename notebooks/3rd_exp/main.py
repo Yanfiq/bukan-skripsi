@@ -20,6 +20,7 @@
 import shutil
 import subprocess
 from pathlib import Path
+import gc
 import os
 import random
 import time
@@ -764,10 +765,47 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+# Training is finished, so release optimizer state and any tensors retained by
+# the final batch before loading the best checkpoint for test evaluation.
+# In particular, loading a checkpoint directly onto `device` would briefly keep
+# a second full copy of the model weights in VRAM.
+model.zero_grad(set_to_none=True)
+optimizer.zero_grad(set_to_none=True)
+del optimizer
+
+for variable_name in (
+    "batch",
+    "labels",
+    "score",
+    "loss",
+    "text_inputs",
+    "image_inputs",
+    "train_targets_all",
+    "train_outputs_all",
+    "iter_bar",
+):
+    globals().pop(variable_name, None)
+
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    print(
+        "GPU memory after training cleanup: "
+        f"{torch.cuda.memory_allocated(device) / 1024**3:.2f} GiB allocated, "
+        f"{torch.cuda.memory_reserved(device) / 1024**3:.2f} GiB reserved"
+    )
+
 # Evaluate the test set once, using the checkpoint selected on validation data.
 best_model_path = run_output_dir / 'model.pt'
 if best_model_path.exists():
-    model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
+    checkpoint_state = torch.load(best_model_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(checkpoint_state)
+    del checkpoint_state
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     test_loss, test_acc, test_f1, test_precision, test_recall = evaluate_acc_f1(
         params, model, device, test_dataset, tokenizer, processor, average='macro', mode='test'
     )
