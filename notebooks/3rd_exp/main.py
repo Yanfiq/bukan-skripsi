@@ -30,7 +30,7 @@ import time
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # %%
-subprocess.run(["uv", "add", "nbformat", "gdown", "torch", "torchvision", "transformers==4.49.0", "gdown", "multilingual-clip", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo", "wandb"])
+subprocess.run(["uv", "add", "nbformat", "gdown", "torch", "torchvision", "transformers==4.49.0", "sentence-transformers", "pillow", "pandas", "scikit-learn", "tqdm", "torchinfo", "wandb"])
 
 # %%
 # Optional: Install 7z if on Linux
@@ -94,29 +94,29 @@ class BlankObject:
     pass
 
 params = BlankObject()
-params.text_model_name = "M-CLIP/LABSE-Vit-L-14"
-params.vision_model_name = "openai/clip-vit-large-patch14"
+params.text_model_name = "sentence-transformers/clip-ViT-B-32-multilingual-v1"
+params.vision_model_name = "openai/clip-vit-base-patch32"
 params.device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
 params.simple_linear = False
-params.fuse_dim = 768        # M-CLIP project dim and ViT-L-14 visual projection dim
-params.text_size = 768
+params.fuse_dim = 512        # CLIP ViT-B/32 shared projection dimension
+params.text_size = 512
 params.image_size = 768
 params.layers = 3
 params.dropout_rate = 0.1
 params.num_train_epochs = 10
-params.freeze_encoder_epochs = 2
+params.freeze_encoder_epochs = 0
 params.vram_reservation_target_gib = 14.0
 params.vram_safety_margin_gib = 0.5
 params.vram_poll_interval_seconds = 60
 params.train_batch_size = 8
 params.dev_batch_size = 8
 params.max_len = 77
-params.encoder_learning_rate = 1e-5
-params.task_learning_rate = 1e-4
+params.encoder_learning_rate = 1e-6
+params.task_learning_rate = 5e-4
 params.label_count = 2
 params.label_number = 2
 params.output_dir = "./saved_models"
-params.model = "mclip_v1_en_baseline"
+params.model = "multilingual_mv_clip_vit_b_32"
 params.seed = 42
 params.wandb_project = "skripsi_3rd-exp"
 
@@ -229,7 +229,7 @@ print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Te
 # test_dataset = MMSD2_id_dataset(df.iloc[test_indices], dataset_dir)
 
 # %% [markdown]
-# # Model Architecture: Multilingual CLIP Multimodal Fusion
+# # Model Architecture: Original MMSD2.0 MV-CLIP Fusion
 
 # %%
 import copy
@@ -238,7 +238,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertConfig, CLIPVisionModelWithProjection
 from transformers.models.bert.modeling_bert import BertLayer
-from multilingual_clip import pt_multilingual_clip
+from sentence_transformers import SentenceTransformer
 from sklearn import metrics
 from tqdm import tqdm, trange
 
@@ -276,15 +276,16 @@ class SarcasmModel(nn.Module):
     def __init__(self, args):
         super(SarcasmModel, self).__init__()
         self.args = args
-        self.fuse_dim = getattr(args, "fuse_dim", 768)
+        self.fuse_dim = getattr(args, "fuse_dim", 512)
 
-        # 1. Multilingual Text Encoder (LaBSE + Linear Projection to shared space)
-        self.mclip = pt_multilingual_clip.MultilingualCLIP.from_pretrained(args.text_model_name)
-        self.text_encoder = self.mclip.transformer
-        self.text_projection = self.mclip.LinearTransformation
-
-        # 2. CLIP Vision Encoder (OpenAI ViT-L/14 with Projection to 768)
-        self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(args.vision_model_name)
+        # The multilingual checkpoint is a text-only DistilBERT model trained
+        # to match the unchanged OpenAI CLIP ViT-B/32 image embedding space.
+        self.multilingual_text_model = SentenceTransformer(args.text_model_name)
+        self.text_encoder = self.multilingual_text_model[0].auto_model
+        self.text_projection = self.multilingual_text_model[2]
+        self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            args.vision_model_name
+        )
 
         # 3. Multimodal Cross-Attention Fusion
         self.config = BertConfig.from_pretrained("bert-base-uncased")
@@ -294,34 +295,33 @@ class SarcasmModel(nn.Module):
 
         # 4. Unimodal projection heads
         if args.simple_linear:
-            self.text_linear = nn.Linear(self.fuse_dim, self.fuse_dim)
-            self.image_linear = nn.Linear(self.fuse_dim, self.fuse_dim)
+            self.text_linear = nn.Linear(args.text_size, args.text_size)
+            self.image_linear = nn.Linear(args.image_size, args.image_size)
         else:
             self.text_linear = nn.Sequential(
-                nn.Linear(self.fuse_dim, self.fuse_dim),
+                nn.Linear(args.text_size, args.text_size),
                 nn.Dropout(args.dropout_rate),
                 nn.GELU()
             )
             self.image_linear = nn.Sequential(
-                nn.Linear(self.fuse_dim, self.fuse_dim),
+                nn.Linear(args.image_size, args.image_size),
                 nn.Dropout(args.dropout_rate),
                 nn.GELU()
             )
 
         # 5. Classifiers & loss
-        self.classifier_fuse = nn.Linear(self.fuse_dim, args.label_number)
-        self.classifier_text = nn.Linear(self.fuse_dim, args.label_number)
-        self.classifier_image = nn.Linear(self.fuse_dim, args.label_number)
+        self.classifier_fuse = nn.Linear(args.text_size, args.label_number)
+        self.classifier_text = nn.Linear(args.text_size, args.label_number)
+        self.classifier_image = nn.Linear(args.image_size, args.label_number)
 
         self.loss_fct = nn.CrossEntropyLoss()
-        self.att = nn.Linear(self.fuse_dim, 1, bias=False)
+        self.att = nn.Linear(args.text_size, 1, bias=False)
         self.encoders_frozen = False
 
     def set_encoders_trainable(self, trainable):
         """Freeze or unfreeze both pretrained encoders and their projections."""
         encoder_modules = (
-            self.text_encoder,
-            self.text_projection,
+            self.multilingual_text_model,
             self.vision_encoder,
         )
         for module in encoder_modules:
@@ -336,8 +336,7 @@ class SarcasmModel(nn.Module):
         """Keep frozen encoders deterministic while training the new layers."""
         super().train(mode)
         if mode and self.encoders_frozen:
-            self.text_encoder.eval()
-            self.text_projection.eval()
+            self.multilingual_text_model.eval()
             self.vision_encoder.eval()
         return self
 
@@ -351,21 +350,44 @@ class SarcasmModel(nn.Module):
             if 'labels' in kwargs and labels is None:
                 labels = kwargs['labels']
 
-        # 1. Text Feature Extraction & Projection
-        text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        text_hidden_states = text_out.last_hidden_state  # [B, L_text, text_dim]
-        text_embeds = self.text_projection(text_hidden_states)  # [B, L_text, fuse_dim]
+        text_output = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        text_hidden_states = text_output.last_hidden_state
 
-        # Mean-pooled text feature (attention masked)
-        text_att_expanded = attention_mask.unsqueeze(-1).to(text_embeds.dtype)
-        text_pooled = (text_embeds * text_att_expanded).sum(dim=1) / text_att_expanded.sum(dim=1).clamp(min=1e-9)
-        text_feature = self.text_linear(text_pooled)  # [B, fuse_dim]
+        vision_output = self.vision_encoder(
+            pixel_values=pixel_values,
+            output_attentions=False,
+            return_dict=True,
+        )
+        image_hidden_states = vision_output.last_hidden_state
 
-        # 2. Vision Feature Extraction & Projection
-        vision_out = self.vision_encoder(pixel_values=pixel_values, output_attentions=False)
-        image_hidden_states = vision_out.last_hidden_state  # [B, L_img, vision_dim]
-        image_embeds = self.vision_encoder.visual_projection(image_hidden_states)  # [B, L_img, fuse_dim]
-        image_feature = self.image_linear(vision_out.image_embeds)  # [B, fuse_dim]
+        # Reproduce the Sentence-Transformers checkpoint's official masked-mean
+        # pooling, followed by its learned 768 -> 512 CLIP-space projection.
+        text_mask = attention_mask.unsqueeze(-1).to(text_hidden_states.dtype)
+        text_pooled = (text_hidden_states * text_mask).sum(dim=1)
+        text_pooled = text_pooled / text_mask.sum(dim=1).clamp(min=1e-9)
+        text_feature = self.text_projection(
+            {"sentence_embedding": text_pooled}
+        )["sentence_embedding"]
+        text_feature = self.text_linear(text_feature)
+
+        # ViT-B/32's original image-only branch uses the post-layernorm 768-D
+        # CLS representation, as in the upstream MMSD2.0 CLIPModel.
+        image_pooled = self.vision_encoder.vision_model.post_layernorm(
+            image_hidden_states[:, 0, :]
+        )
+        image_feature = self.image_linear(image_pooled)
+
+        # The checkpoint's Dense layer is a bias-free linear 768 -> 512 map
+        # with Identity activation, so it can also project each text token into
+        # the shared space used by the multimodal fusion transformer.
+        text_embeds = self.text_projection.activation_function(
+            self.text_projection.linear(text_hidden_states)
+        )
+        image_embeds = self.vision_encoder.visual_projection(image_hidden_states)
 
         # 3. Multimodal Token Concatenation & Cross-Attention
         num_img_tokens = image_embeds.shape[1]
@@ -383,10 +405,12 @@ class SarcasmModel(nn.Module):
         fuse_hiddens = self.trans(input_embeds, extended_mask, output_all_encoded_layers=False)
         fuse_hiddens = fuse_hiddens[-1]  # [B, L_total, fuse_dim]
 
-        # 4. Multimodal Pooled Representations
+        # 4. Multimodal pooled representations. The multilingual tokenizer has
+        # no CLIP EOT convention, so use its official attention-masked mean.
         new_image_feature = fuse_hiddens[:, 0, :]  # Visual CLS token [B, fuse_dim]
         new_text_tokens = fuse_hiddens[:, num_img_tokens:, :]  # Fused text tokens [B, L_text, fuse_dim]
-        new_text_feature = (new_text_tokens * text_att_expanded).sum(dim=1) / text_att_expanded.sum(dim=1).clamp(min=1e-9)
+        new_text_feature = (new_text_tokens * text_mask).sum(dim=1)
+        new_text_feature = new_text_feature / text_mask.sum(dim=1).clamp(min=1e-9)
 
         # 5. Adaptive Attention Fusion
         text_weight = self.att(new_text_feature)
@@ -405,9 +429,9 @@ class SarcasmModel(nn.Module):
         text_score = F.softmax(logits_text, dim=-1)
         image_score = F.softmax(logits_image, dim=-1)
 
-        # An equal-weight ensemble of the three heads. Averaging preserves the
-        # predicted class while returning a valid probability distribution.
-        score = (fuse_score + text_score + image_score) / 3.0
+        # Retain the upstream ensemble behavior (the values sum to 3, while
+        # argmax predictions are identical to an equal-weight average).
+        score = fuse_score + text_score + image_score
 
         outputs = (score,)
         if labels is not None:
@@ -521,8 +545,7 @@ if params.freeze_encoder_epochs > 0:
     model.set_encoders_trainable(False)
     print(f"Pretrained encoders frozen for the first {params.freeze_encoder_epochs} epochs")
 
-encoder_parameters = list(model.text_encoder.parameters())
-encoder_parameters += list(model.text_projection.parameters())
+encoder_parameters = list(model.multilingual_text_model.parameters())
 encoder_parameters += list(model.vision_encoder.parameters())
 encoder_parameter_ids = {id(parameter) for parameter in encoder_parameters}
 task_parameters = [

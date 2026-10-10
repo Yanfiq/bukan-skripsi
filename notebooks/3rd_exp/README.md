@@ -1,11 +1,9 @@
 # Eksperimen ke Third
 
 TL;DR\
-Model adaptasi dari MMSD2.0 dengan beberapa perubahan
-- Tes model multilingual CLIP
-
-Hasil\
-- Model ngalamin penurunan performa sekitar 10% (F1-Score)
-
-Next exp\
-- Implementasi optimal transport pake wassertain distance di interactive view buat coba ngatasi encoder yang gk aligned
+Reimplementasi arsitektur MV-CLIP dari MMSD2.0 dengan struktur training notebook
+yang lebih baru. Model memakai text encoder multilingual
+`sentence-transformers/clip-ViT-B-32-multilingual-v1`, image encoder CLIP
+ViT-B/32, fusion dimension 512, dan ensemble tiga head dari implementasi
+upstream. Karena tokenizer multilingual tidak memiliki konvensi EOT milik
+CLIP, cabang teks menggunakan attention-masked mean pooling bawaan model.
