@@ -34,5 +34,6 @@ CLIP, cabang teks menggunakan attention-masked mean pooling bawaan model.
   accuracy terbaik. Kode asli mengevaluasi test set setiap kali validation
   accuracy meningkat.
 - Model checkpoint dicatat sebagai W&B artifact, dan tersedia mekanisme
-  optional encoder freezing, learning rate terpisah, pemeriksaan VRAM sebelum
-  unfreezing, serta pembersihan CUDA cache sebelum test evaluation.
+  optional encoder freezing, learning rate terpisah, linear warmup/decay
+  scheduler, pemeriksaan VRAM sebelum unfreezing, serta pembersihan CUDA cache
+  sebelum test evaluation.

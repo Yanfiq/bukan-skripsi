@@ -108,11 +108,13 @@ params.freeze_encoder_epochs = 0
 params.vram_reservation_target_gib = 14.0
 params.vram_safety_margin_gib = 0.5
 params.vram_poll_interval_seconds = 60
-params.train_batch_size = 8
-params.dev_batch_size = 8
+params.train_batch_size = 32
+params.dev_batch_size = 32
 params.max_len = 77
 params.encoder_learning_rate = 1e-6
 params.task_learning_rate = 5e-4
+params.weight_decay = 0.05
+params.warmup_proportion = 0.2
 params.label_count = 2
 params.label_number = 2
 params.output_dir = "./saved_models"
@@ -236,7 +238,11 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BertConfig, CLIPVisionModelWithProjection
+from transformers import (
+    BertConfig,
+    CLIPVisionModelWithProjection,
+    get_linear_schedule_with_warmup,
+)
 from transformers.models.bert.modeling_bert import BertLayer
 from sentence_transformers import SentenceTransformer
 from sklearn import metrics
@@ -554,9 +560,10 @@ task_parameters = [
     if id(parameter) not in encoder_parameter_ids
 ]
 
-# Fused Adam avoids the large update temporaries created by the foreach and
-# single-tensor implementations for these two large encoders.
-optimizer = torch.optim.Adam(
+# Match the original MMSD2.0 optimizer while retaining separate learning rates.
+# The fused CUDA implementation avoids the large update temporaries created by
+# the foreach and single-tensor implementations for these two large encoders.
+optimizer = torch.optim.AdamW(
     [
         {
             "params": encoder_parameters,
@@ -569,11 +576,21 @@ optimizer = torch.optim.Adam(
             "group_name": "fusion_and_classifiers",
         },
     ],
+    weight_decay=params.weight_decay,
     fused=device.type == "cuda",
+)
+total_training_steps = len(train_loader) * int(params.num_train_epochs)
+warmup_steps = int(params.warmup_proportion * total_training_steps)
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=total_training_steps,
 )
 print(
     f"Learning rates -> encoders: {params.encoder_learning_rate:.2e}, "
-    f"fusion/classifiers: {params.task_learning_rate:.2e}"
+    f"fusion/classifiers: {params.task_learning_rate:.2e}; "
+    f"AdamW weight decay: {params.weight_decay:.2f}; "
+    f"linear warmup: {warmup_steps}/{total_training_steps} steps"
 )
 
 
@@ -671,6 +688,10 @@ wandb_run = wandb.init(
         "max_len": int(params.max_len),
         "encoder_learning_rate": float(params.encoder_learning_rate),
         "task_learning_rate": float(params.task_learning_rate),
+        "weight_decay": float(params.weight_decay),
+        "warmup_proportion": float(params.warmup_proportion),
+        "warmup_steps": int(warmup_steps),
+        "total_training_steps": int(total_training_steps),
         "fusion_layers": int(params.layers),
         "dropout_rate": float(params.dropout_rate),
         "seed": int(params.seed),
@@ -732,6 +753,7 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
         iter_bar.set_description(f"Epoch {i_epoch} Loss: {loss.item():.4f}")
         loss.backward()
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad()
 
     avg_train_loss = sum_loss / max(sum_step, 1)
@@ -795,6 +817,7 @@ for i_epoch in trange(0, int(params.num_train_epochs), desc="Epoch", disable=Fal
 model.zero_grad(set_to_none=True)
 optimizer.zero_grad(set_to_none=True)
 del optimizer
+del scheduler
 
 for variable_name in (
     "batch",
