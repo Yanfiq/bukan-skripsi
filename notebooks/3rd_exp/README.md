@@ -37,3 +37,9 @@ CLIP, cabang teks menggunakan attention-masked mean pooling bawaan model.
   optional encoder freezing, learning rate terpisah, linear warmup/decay
   scheduler, pemeriksaan VRAM sebelum unfreezing, serta pembersihan CUDA cache
   sebelum test evaluation.
+
+## Komparasi performa dengan implementasi asli MMSD2.0
+| Model | Accuracy   | Precision | Recall  | F1       |
+|-------|------------|-----------|---------|----------|
+| MV-CLIP (MMSD2.0) | 85.4296 | 80.4078 | 87.4638 | 83.7875 |
+| MV-MCLIP (3rd experiment) | null | null | null | null |
