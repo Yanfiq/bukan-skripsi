@@ -42,4 +42,4 @@ CLIP, cabang teks menggunakan attention-masked mean pooling bawaan model.
 | Model | Accuracy   | Precision | Recall  | F1       |
 |-------|------------|-----------|---------|----------|
 | MV-CLIP (MMSD2.0) | 85.4296 | 80.4078 | 87.4638 | 83.7875 |
-| MV-MCLIP (3rd experiment) | null | null | null | null |
+| MV-MCLIP (3rd experiment) | 83.8107 | 83.8107 | 83.8107 | 83.8107 |
