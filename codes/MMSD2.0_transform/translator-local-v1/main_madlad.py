@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
@@ -73,7 +74,27 @@ def format_json_object(obj: dict) -> str:
     return "  " + formatted.replace("\n", "\n  ")
 
 
-def translate_dataset(input_path: Path, output_path: Path, device: str, limit: int | None = None, in_place: bool = False):
+def show_progress(completed: int, total: int, bar_width: int = 30) -> None:
+    progress = completed / total if total else 1.0
+    filled_width = round(bar_width * progress)
+    bar = "#" * filled_width + "-" * (bar_width - filled_width)
+    remaining = total - completed
+    print(
+        f"\r[{bar}] {progress:6.1%} | translated: {completed}/{total} | left: {remaining}",
+        end="\n" if completed == total else "",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def translate_dataset(
+    input_path: Path,
+    output_path: Path,
+    device: str,
+    limit: int | None = None,
+    in_place: bool = False,
+    verbose: bool = False,
+):
     records = load_records(input_path)
 
     if limit is not None:
@@ -86,6 +107,9 @@ def translate_dataset(input_path: Path, output_path: Path, device: str, limit: i
 
     final_output.parent.mkdir(parents=True, exist_ok=True)
     total_written = 0
+    if verbose:
+        show_progress(total_written, len(records))
+
     with final_output.open("w", encoding="utf-8") as f:
         f.write("[\n")
         first = True
@@ -110,6 +134,8 @@ def translate_dataset(input_path: Path, output_path: Path, device: str, limit: i
             first = False
             total_written += 1
             f.flush()
+            if verbose:
+                show_progress(total_written, len(records))
 
         f.write("\n]\n")
 
@@ -123,6 +149,7 @@ def parse_args():
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda", help="Device to run translation on.")
     parser.add_argument("--limit", type=int, default=None, help="Optional number of rows to translate for a quick test run.")
     parser.add_argument("--in-place", action="store_true", help="Write back to the same input file instead of the default output path.")
+    parser.add_argument("--verbose", action="store_true", help="Show translation progress and the number of records remaining.")
     return parser.parse_args()
 
 
@@ -141,6 +168,7 @@ def main():
         device=args.device,
         limit=args.limit,
         in_place=args.in_place,
+        verbose=args.verbose,
     )
 
 
