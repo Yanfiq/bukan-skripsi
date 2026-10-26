@@ -8,6 +8,16 @@ ViT-B/32, fusion dimension 512, dan ensemble tiga head dari implementasi
 upstream. Karena tokenizer multilingual tidak memiliki konvensi EOT milik
 CLIP, cabang teks menggunakan attention-masked mean pooling bawaan model.
 
+## Varian pooling
+
+- `mv_clip_multilingual_mean_mean.py`: menggunakan masked-mean pooling pada
+  text-only branch dan fused-text branch. Ini adalah varian yang paling sesuai
+  dengan konfigurasi pooling checkpoint multilingual.
+- `mv_clip_multilingual_mean_cls.py`: tetap menggunakan masked-mean pooling
+  pada text-only branch, tetapi mengambil token `[CLS]` setelah multimodal
+  fusion. Varian ini digunakan sebagai ablation yang lebih menyerupai pemilihan
+  token EOT pada implementasi MV-CLIP asli.
+
 ## Perbedaan dengan implementasi asli MMSD2.0
 
 - Text encoder asli dari `openai/clip-vit-base-patch32` diganti dengan
@@ -20,9 +30,10 @@ CLIP, cabang teks menggunakan attention-masked mean pooling bawaan model.
 - Hidden state text encoder berukuran 768 dimensi, lalu diproyeksikan ke shared
   CLIP space berukuran 512 dimensi menggunakan projection layer bawaan model
   multilingual. Kode asli langsung menghasilkan token text 512 dimensi.
-- Pemilihan representasi teks menggunakan attention-masked mean pooling. Kode
-  asli memakai token EOT melalui `input_ids.argmax()`, tetapi asumsi tersebut
-  tidak berlaku untuk tokenizer multilingual DistilBERT.
+- Text-only branch menggunakan attention-masked mean pooling. Fused-text branch
+  menggunakan masked mean pada varian Mean/Mean dan token `[CLS]` pada varian
+  Mean/CLS. Kode asli memakai token EOT melalui `input_ids.argmax()`, tetapi
+  asumsi tersebut tidak berlaku untuk tokenizer multilingual DistilBERT.
 - Struktur utama MV-CLIP tetap dipertahankan: 50 image tokens, fusion
   transformer 512 dimensi, adaptive text-image weighting, tiga classification
   heads, penjumlahan ketiga probability outputs, dan penjumlahan ketiga

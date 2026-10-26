@@ -6,7 +6,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.19.5
+#       jupytext_version: 1.19.6
 #   kernelspec:
 #     display_name: Python3 (ipykernel)
 #     language: python
@@ -118,7 +118,7 @@ params.warmup_proportion = 0.2
 params.label_count = 2
 params.label_number = 2
 params.output_dir = "./saved_models"
-params.model = "multilingual_mv_clip_vit_b_32"
+params.model = "multilingual_mv_clip_vit_b_32_mean_cls"
 params.seed = 42
 params.wandb_project = "skripsi_3rd-exp"
 
@@ -411,12 +411,12 @@ class SarcasmModel(nn.Module):
         fuse_hiddens = self.trans(input_embeds, extended_mask, output_all_encoded_layers=False)
         fuse_hiddens = fuse_hiddens[-1]  # [B, L_total, fuse_dim]
 
-        # 4. Multimodal pooled representations. The multilingual tokenizer has
-        # no CLIP EOT convention, so use its official attention-masked mean.
+        # 4. Multimodal pooled representations. Keep the checkpoint's official
+        # mean pooling for the text-only branch, but use the fused text [CLS]
+        # token here as the EOT-like sequence summary for this ablation.
         new_image_feature = fuse_hiddens[:, 0, :]  # Visual CLS token [B, fuse_dim]
         new_text_tokens = fuse_hiddens[:, num_img_tokens:, :]  # Fused text tokens [B, L_text, fuse_dim]
-        new_text_feature = (new_text_tokens * text_mask).sum(dim=1)
-        new_text_feature = new_text_feature / text_mask.sum(dim=1).clamp(min=1e-9)
+        new_text_feature = new_text_tokens[:, 0, :]  # Multilingual text CLS token
 
         # 5. Adaptive Attention Fusion
         text_weight = self.att(new_text_feature)
